@@ -65,7 +65,7 @@ def build_archive(root: Path, output_dir: Path) -> Path:
             archive.add(package_root, arcname=package_name)
 
     checksum_lines = [f"{sha256(archive_path)}  {archive_path.name}"]
-    checksum_path.write_text("\n".join(checksum_lines) + "\n", encoding="ascii")
+    checksum_path.write_bytes(("\n".join(checksum_lines) + "\n").encode("ascii"))
     return archive_path
 
 

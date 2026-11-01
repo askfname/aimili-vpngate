@@ -4,36 +4,14 @@
 
 **面向 Linux VPS 的 VPNGate 节点管理与 HTTP / HTTPS / SOCKS5 代理网关**
 
-[![正式版本](https://img.shields.io/github/v/release/baoweise-bot/aimili-vpngate?style=flat-square&label=正式版&color=16a34a)](https://github.com/baoweise-bot/aimili-vpngate/releases/latest)
-[![Docker](https://img.shields.io/badge/Docker-amd64%20%7C%20386%20%7C%20arm64%20%7C%20armv7-0ea5e9?style=flat-square&logo=docker&logoColor=white)](https://github.com/baoweise-bot/aimili-vpngate/pkgs/container/aimili-vpngate)
+[![正式版本](https://img.shields.io/github/v/release/askfname/aimili-vpngate?style=flat-square&label=正式版&color=16a34a)](https://github.com/askfname/aimili-vpngate/releases/latest)
 [![License](https://img.shields.io/badge/License-GPL--3.0-334155?style=flat-square)](LICENSE)
 
 **简体中文** · [English](docs/README.en.md) · [日本語](docs/README.ja.md) · [한국어](docs/README.ko.md)
 
-[快速安装](#quick-install) · [完整安装](#installation) · [连接使用](#connection) · [服务商推荐](#vps) · [社区入口](#community) · [法律声明](#legal)
-
-[![项目网站](https://img.shields.io/badge/项目网站-339936.xyz-f97316?style=for-the-badge)](https://339936.xyz)
-[![Telegram](https://img.shields.io/badge/Telegram-交流群-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/arestemple)
-[![YouTube](https://img.shields.io/badge/YouTube-视频教程-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=s-ATfXR8BpI)
+[快速安装](#quick-install) · [完整安装](#installation) · [连接使用](#connection) · [法律声明](#legal)
 
 </div>
-
-<a id="vps"></a>
-
-## 🤝 赞助商 / 优质服务商推荐
-
-> 如果本开源项目对你有帮助，欢迎了解并支持我们的赞助伙伴：
-
-## 服务商推荐
-
-| 商家 | 推荐理由 | 入口 |
-| :--- | :--- | :---: |
-| <table><tr><td bgcolor="#0969da"><b><font color="#ffffff">Bandwagon</font></b></td></tr></table> | <sub>代理 & 建站推荐：CN2/9929/CMI三网直连 2500 Mbps 高速线路；低延迟、高稳定性，适合直播、带货和长期出海业务。</sub> | [立即查看](https://bandwagonhost.com/aff.php?aff=81790) |
-| <table><tr><td bgcolor="#bf8700"><b><font color="#ffffff">RackNerd</font></b></td></tr></table> | <sub>综合服务器推荐：4000GB 大流量，价格与配置性价比突出；部署成本低，适合需要长期稳定运行的服务。</sub> | [立即查看](https://my.racknerd.com/aff.php?aff=18708) |
-| <table><tr><td bgcolor="#8250df"><b><font color="#ffffff">OpenMili</font></b></td></tr></table> | <sub>OpenMili Ai 中转站推荐：GPT-6 Astra & Images 2.0 Pro 美区原价 0.12倍率 不掺假、不降智，接受任何压力测试！</sub> | [立即查看](https://openmili.com/) |
-| <table><tr><td bgcolor="#bc4c00"><b><font color="#ffffff">IPFLY</font></b></td></tr></table> | <sub>代理服务推荐： 全球200多个国家和地区覆盖，9000万+住宅 IP 资源，稳定安全、可靠连接，适合跨境电商、社媒运营、数据采集等业务；新用户注册专享 7 折优惠，低成本开启全球业务！</sub> | [立即查看](https://console.ipfly.net/register?ad_source=yt_xbjyz) |
-| <table><tr><td bgcolor="#cf222e"><b><font color="#ffffff">JTTI VPS</font></b></td></tr></table> | <sub>稳定建站服务器推荐：5 Mbps 独享带宽 无限流量 CN2/9929/CMI三网直连，跨境网站访问低延迟，长期稳定API运营。</sub> | [立即查看](https://www.jtti.cc/zh/activity/y2026-national-day.html?k=baoweise) |
----
 
 AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与检测、连接切换、Web 管理后台，以及共用一个端口的 HTTP、HTTPS 网站代理和 SOCKS5 代理服务。
 
@@ -41,8 +19,8 @@ AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与�
 | --- | --- |
 | Web 管理后台 | TCP `8787` + 独立安全路径 + 账号密码 |
 | 本机代理 | `127.0.0.1:7928`，支持 HTTP、HTTPS `CONNECT` 和 SOCKS5 |
+| OpenCode 检测 | 按国家 + IP 类型筛选节点，多线程按节点出口检测公开免费模型 |
 | 源码部署 | x64、x86、ARM64、ARM32 Linux |
-| Docker 镜像 | `linux/amd64`、`linux/386`、`linux/arm64`、`linux/arm/v7` |
 | 更新通道 | GitHub `main` 正式分支 / 最新正式 Release |
 
 > [!IMPORTANT]
@@ -54,7 +32,7 @@ AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与�
 使用 `root` 用户在受支持的 Linux VPS 上执行：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/install.sh)
 ```
 
 安装完成后，终端会显示 Web 后台完整地址、随机安全路径、登录账号和密码。输入 `ml` 可打开管理菜单。
@@ -62,7 +40,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
 无人值守安装可显式跳过首次参数询问，并自动生成安全路径和登录凭据：
 
 ```bash
-AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/install.sh)
 ```
 
 > [!TIP]
@@ -75,12 +53,12 @@ AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/bao
 
 - 操作系统：Ubuntu、Debian、Alpine、CentOS、RHEL、Rocky Linux、AlmaLinux、Fedora、Oracle Linux 或 Amazon Linux。
 - 权限与组件：`root`、OpenVPN、iptables、策略路由和 TUN/TAP。
-- Windows 与 macOS 可作为代理客户端，但不能直接运行完整网关；Docker Desktop 也不等同于具备宿主机 TUN 能力的 Linux VPS。
+- Windows 与 macOS 可作为代理客户端，但不能直接运行完整网关。
 
-### 方式一：一键源码安装
+### 一键源码安装
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/install.sh)
 ```
 
 安装器会部署到 `/opt/aimilivpn` 并注册系统服务。常用命令：
@@ -98,66 +76,12 @@ ml uninstall       # 卸载
 需要先审查脚本时：
 
 ```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
+git clone --branch main --single-branch https://github.com/askfname/aimili-vpngate.git
 cd aimili-vpngate
 sudo bash install.sh
 ```
 
-通用 Linux 源码包与 SHA-256 校验文件可在 [GitHub Releases](https://github.com/baoweise-bot/aimili-vpngate/releases/latest) 下载，版本变更记录也统一放在 Release Notes 中。
-
-### 方式二：Docker Compose
-
-Docker 主机需要 `/dev/net/tun`、host 网络以及 `NET_ADMIN`、`NET_RAW` 权限。
-
-```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
-cd aimili-vpngate
-docker compose pull
-docker compose up -d
-docker logs -f aimilivpn
-```
-
-正式镜像：`ghcr.io/baoweise-bot/aimili-vpngate:2.1`
-
-更新容器：
-
-```bash
-docker compose pull
-docker compose up -d
-```
-
-<details>
-<summary><strong>查看 docker run 命令</strong></summary>
-
-```bash
-docker run -d \
-  --name aimilivpn \
-  --restart unless-stopped \
-  --network host \
-  --cap-add NET_ADMIN \
-  --cap-add NET_RAW \
-  --device /dev/net/tun:/dev/net/tun \
-  -e UI_HOST=0.0.0.0 \
-  -e UI_PORT=8787 \
-  -e LOCAL_PROXY_HOST=127.0.0.1 \
-  -e LOCAL_PROXY_PORT=7928 \
-  -v aimilivpn-data:/data \
-  ghcr.io/baoweise-bot/aimili-vpngate:2.1
-```
-
-</details>
-
-<details>
-<summary><strong>无法拉取 GHCR 时在 VPS 本地构建</strong></summary>
-
-```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
-cd aimili-vpngate
-docker compose build
-docker compose up -d
-```
-
-</details>
+通用 Linux 源码包与 SHA-256 校验文件可在 [GitHub Releases](https://github.com/askfname/aimili-vpngate/releases/latest) 下载，版本变更记录也统一放在 Release Notes 中。
 
 <a id="connection"></a>
 ## 连接与使用
@@ -171,14 +95,6 @@ http://VPS_IP:8787/随机安全路径/
 ```
 
 忘记地址时执行 `ml status`；需要重设账号密码时执行 `ml password`。
-
-Docker 用户可以读取首次启动时保存的 Web 配置：
-
-```bash
-docker exec aimilivpn cat /data/ui_auth.json
-```
-
-使用其中的 `secret_path`、`username` 和 `password` 登录，并在首次登录后修改安全路径和凭据。
 
 ### 2. 获取并连接节点
 
@@ -223,7 +139,41 @@ print(response.text)
 
 </details>
 
-### 4. 从电脑或其他设备连接
+### 4. 一键检测 OpenCode 节点
+
+Web 工具栏的“检测 OpenCode”会对当前“国家 + IP 类型”筛选结果中的全部节点并发建立临时测试隧道，并通过各节点出口请求 OpenCode 公开免费模型。检测只使用国家和 IP 类型筛选，忽略可用状态与收藏过滤，确保覆盖当前范围内的所有节点。
+
+- **可用**：节点出口成功返回非空模型回复，可直接使用 OpenCode 免费额度。
+- **额度用尽**：返回 `402`、`429` 或 Free usage limit 等额度限制。
+- **不可用**：建隧失败、TLS/连接失败、鉴权失败或响应为空。
+- **未检测**：尚未运行检测。
+- 检测可随时停止；结果列与进度面板实时更新，“只看可用”可快速筛出成功节点。
+- 检测会临时占用多个 `tun` 接口和策略路由，期间节点切换与手动测试暂时禁用，请等待检测结束或先停止检测。
+
+> 检测依赖 Linux TUN/TAP、OpenVPN、`iproute2` 以及 `root`/`NET_ADMIN` 权限；Windows/macOS 客户端无法执行。公开通道额度按节点出口 IP 计算，不代表第三方节点本身长期稳定。
+
+<details>
+<summary><strong>OpenCode 检测环境变量</strong></summary>
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `OPENCODE_API_BASE` | `https://opencode.ai/zen/v1` | Zen 公开 API 根地址 |
+| `OPENCODE_API_URL` | `${OPENCODE_API_BASE}/chat/completions` | 检测用补全接口 |
+| `OPENCODE_MODELS_URL` | `${OPENCODE_API_BASE}/models` | 免费模型列表接口 |
+| `OPENCODE_API_KEY` | `public` | 公开通道 Bearer 值 |
+| `OPENCODE_MODEL` | 空（自动选择免费模型） | 指定检测模型 |
+| `OPENCODE_FALLBACK_MODEL` | `big-pickle` | 模型列表不可用时的备用模型 |
+| `OPENCODE_CHECK_WORKERS` | `10` | 并发测试隧道数，范围 1–24 |
+| `OPENCODE_CHECK_TIMEOUT_SECONDS` | `20` | 单节点 API 请求超时 |
+| `OPENCODE_OPENVPN_TIMEOUT_SECONDS` | `12` | 单节点建隧超时 |
+| `OPENCODE_CHECK_NODE_LIMIT` | `2000` | 单次检测节点上限 |
+| `OPENCODE_EXTRA_HEADERS` | 空 | 额外请求头，JSON 对象字符串 |
+
+修改环境变量后重启服务或容器生效。
+
+</details>
+
+### 5. 从电脑或其他设备连接
 
 代理默认只监听 VPS 回环地址。推荐使用 SSH 隧道，不要直接暴露代理端口：
 
@@ -243,16 +193,6 @@ ssh -N \
 > [!WARNING]
 > `7928` 默认没有面向公网的用户认证。请勿在没有防火墙、来源 IP 限制或其他可靠访问控制的情况下将其直接开放到公网。
 
-<a id="community"></a>
-## 网站、社群与视频
-
-| 入口 | 用途 | 链接 |
-| --- | --- | --- |
-| 项目网站 / 交流论坛 | 公告、经验交流与讨论 | [339936.xyz](https://339936.xyz) |
-| Telegram 群 | 即时交流 | [t.me/arestemple](https://t.me/arestemple) |
-| YouTube 教程 | 安装和使用视频 | [观看视频](https://www.youtube.com/watch?v=s-ATfXR8BpI) |
-| GitHub Issues | 可复现的问题与功能建议 | [提交 Issue](https://github.com/baoweise-bot/aimili-vpngate/issues) |
-
 <a id="legal"></a>
 ## 使用范围与法律声明
 
@@ -268,6 +208,6 @@ ssh -N \
 
 <div align="center">
 
-[正式版本](https://github.com/baoweise-bot/aimili-vpngate/releases/latest) · [问题反馈](https://github.com/baoweise-bot/aimili-vpngate/issues) · [GPL-3.0 License](LICENSE)
+[正式版本](https://github.com/askfname/aimili-vpngate/releases/latest) · [问题反馈](https://github.com/askfname/aimili-vpngate/issues) · [GPL-3.0 License](LICENSE)
 
 </div>

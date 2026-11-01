@@ -49,7 +49,7 @@ IPv6 测试只证明回环访问、双栈监听和通过 IPv4 VPN 出口转发�
 严格执行 README 命令：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/install.sh)
 ```
 
 结果：

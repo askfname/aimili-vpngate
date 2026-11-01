@@ -75,6 +75,36 @@ def valid_snapshot(ip: str = "198.51.100.10") -> str:
     return valid_snapshot_rows([(ip, "Japan", "JP")])
 
 
+class FakeSocket:
+    def __init__(self, response: bytes) -> None:
+        self.response = response
+        self.sent = b""
+        self.address = None
+        self.options = []
+        self.closed = False
+
+    def setsockopt(self, level, option, value) -> None:
+        self.options.append((level, option, value))
+
+    def settimeout(self, timeout) -> None:
+        pass
+
+    def connect(self, address) -> None:
+        self.address = address
+
+    def sendall(self, data: bytes) -> None:
+        self.sent += data
+
+    def recv(self, size: int) -> bytes:
+        if not self.response:
+            return b""
+        chunk, self.response = self.response[:size], self.response[size:]
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class ManagerLogicTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -105,6 +135,23 @@ class ManagerLogicTests(unittest.TestCase):
         manager.background_refill_thread = None
         manager.background_refill_cancel_event.clear()
         manager.active_sessions.clear()
+        manager.opencode_check_thread = None
+        manager.opencode_check_cancel_event.clear()
+        if manager.opencode_check_lock.locked():
+            manager.opencode_check_lock.release()
+        manager.update_opencode_check_stats(
+            running=False,
+            total=0,
+            done=0,
+            available=0,
+            limited=0,
+            failed=0,
+            model="",
+            message="",
+            started_at=0.0,
+            finished_at=0.0,
+            cancelled=False,
+        )
 
     def tearDown(self) -> None:
         if manager.connection_attempt_lock.locked():
@@ -746,9 +793,174 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("official_https", state["last_fetch_source"])
         self.assertIn("保留 0 个", state["last_fetch_message"])
 
+    def test_opencode_models_prefer_known_free_model(self) -> None:
+        payload = {
+            "data": [
+                {"id": "paid-model", "cost": {"text": {"input": {"price": 10}, "output": {"price": 50}}}},
+                {"id": "beam-free", "cost": {"text": {"input": {"price": 0}, "output": {"price": 0}}}},
+                {"id": "big-pickle", "cost": {"text": {"input": {"price": 0}, "output": {"price": 0}}}},
+                {"id": "opaque-free"},
+            ]
+        }
+
+        models = manager.parse_opencode_models(json.dumps(payload))
+
+        self.assertEqual(["big-pickle", "beam-free", "opaque-free"], models)
+        self.assertNotIn("paid-model", models)
+
+    def test_opencode_failure_kind_distinguishes_quota_from_errors(self) -> None:
+        self.assertEqual("limited", manager.opencode_failure_kind(429, "too many requests"))
+        self.assertEqual("limited", manager.opencode_failure_kind(402, "insufficient funds"))
+        self.assertEqual("limited", manager.opencode_failure_kind(403, "Free usage limit reached"))
+        self.assertEqual("limited", manager.opencode_failure_kind(200, "FreeTierError"))
+        self.assertEqual("failed", manager.opencode_failure_kind(401, "Unauthorized"))
+        self.assertEqual("failed", manager.opencode_failure_kind(500, "internal error"))
+
+    def probe_opencode(self, response: bytes) -> tuple[tuple[str, str, int], FakeSocket]:
+        target = {
+            "host": "opencode.ai",
+            "port": 80,
+            "path": "/zen/v1/chat/completions",
+            "ips": ["203.0.113.10"],
+            "https": False,
+            "host_header": "opencode.ai",
+        }
+        fake_socket = FakeSocket(response)
+        with (
+            mock.patch.object(manager.socket, "SO_MARK", 1, create=True),
+            mock.patch.object(manager.socket, "socket", return_value=fake_socket),
+            mock.patch.object(manager, "OPENCODE_API_KEY", "public"),
+        ):
+            result = manager.opencode_http_probe(
+                target,
+                "big-pickle",
+                0x4F430002,
+                threading.Event(),
+            )
+        return result, fake_socket
+
+    def test_opencode_probe_requires_real_stream_content(self) -> None:
+        body = (
+            b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+            b'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n'
+        )
+        response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" + body
+        (status, message, latency), fake_socket = self.probe_opencode(response)
+
+        self.assertEqual("available", status)
+        self.assertIn("OK", message)
+        self.assertGreater(latency, 0)
+        self.assertEqual(("203.0.113.10", 80), fake_socket.address)
+        self.assertEqual(0x4F430002, fake_socket.options[0][2])
+        self.assertIn(b"Authorization: Bearer public", fake_socket.sent)
+        self.assertIn(b'"model": "big-pickle"', fake_socket.sent)
+        self.assertTrue(fake_socket.closed)
+
+    def test_opencode_probe_classifies_quota_and_empty_responses(self) -> None:
+        quota_body = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "FreeUsageLimitError",
+                    "message": "Free usage limit reached.",
+                },
+            }
+        ).encode("utf-8")
+        quota_response = (
+            b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\r\n" + quota_body
+        )
+        empty_response = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+            b'{"choices":[{"message":{"content":"   "}}]}'
+        )
+
+        self.assertEqual("limited", self.probe_opencode(quota_response)[0][0])
+        self.assertEqual("failed", self.probe_opencode(empty_response)[0][0])
+
+    def test_opencode_content_accepts_reasoning_chunks(self) -> None:
+        payload = {"choices": [{"delta": {"reasoning_content": "checking quota"}}]}
+        self.assertEqual("checking quota", manager.opencode_content_text(payload))
+        payload = {"choices": [{"delta": {"content": [{"type": "text", "text": "OK"}]}}]}
+        self.assertEqual("OK", manager.opencode_content_text(payload))
+        self.assertEqual(
+            "Free usage limit reached",
+            manager.opencode_error_text(
+                {"type": "FreeUsageLimitError", "message": "Free usage limit reached"}
+            ),
+        )
+
+    def test_failed_opencode_start_keeps_external_maintenance_lock(self) -> None:
+        self.assertTrue(manager.maintenance_lock.acquire(blocking=False))
+        try:
+            with (
+                mock.patch.object(manager, "ensure_opencode_probe_supported"),
+                self.assertRaises(RuntimeError),
+            ):
+                manager.start_opencode_check(["node-0"])
+            self.assertTrue(manager.maintenance_lock.locked())
+            self.assertFalse(manager.opencode_check_lock.locked())
+        finally:
+            manager.maintenance_lock.release()
+
+    def test_opencode_results_persist_and_reset_interrupted_checks(self) -> None:
+        nodes = self.write_nodes(2)
+        for node in nodes:
+            node["opencode_status"] = "checking"
+        manager.write_json(manager.NODES_FILE, nodes)
+        pending = {
+            nodes[0]["id"]: {
+                "id": nodes[0]["id"],
+                "opencode_status": "available",
+                "opencode_message": "正常回复: OK",
+                "opencode_model": "big-pickle",
+                "opencode_latency_ms": 321,
+                "opencode_checked_at": 100.0,
+            }
+        }
+
+        manager.flush_opencode_results(pending, {nodes[1]["id"]})
+        stored = {node["id"]: node for node in manager.read_nodes()}
+        self.assertEqual("available", stored[nodes[0]["id"]]["opencode_status"])
+        self.assertEqual(321, stored[nodes[0]["id"]]["opencode_latency_ms"])
+        self.assertEqual("", stored[nodes[1]["id"]]["opencode_status"])
+        self.assertEqual("检测已取消", stored[nodes[1]["id"]]["opencode_message"])
+
+        stored[nodes[0]["id"]]["opencode_status"] = "checking"
+        manager.write_json(manager.NODES_FILE, list(stored.values()))
+        manager.reset_stale_opencode_checks()
+        stored = {node["id"]: node for node in manager.read_nodes()}
+        self.assertEqual("", stored[nodes[0]["id"]]["opencode_status"])
+
+    def test_opencode_state_is_exposed_and_blocks_switching(self) -> None:
+        manager.update_opencode_check_stats(running=True, total=3, done=1, available=1)
+        self.assertEqual(3, manager.get_state()["opencode_check"]["total"])
+
+        manager.opencode_check_lock.acquire()
+        try:
+            with self.assertRaises(RuntimeError):
+                manager.begin_connection_attempt()
+        finally:
+            manager.opencode_check_lock.release()
+
+    def test_web_dashboard_exposes_opencode_check_controls(self) -> None:
+        for marker in (
+            'id="btn_opencode_check"',
+            'id="opencode_panel"',
+            'id="opencode_only_available"',
+            'id="opencode_progress_bar"',
+            "function getOpencodeCandidateNodes",
+            "function startOpencodeCheck",
+            "function stopOpencodeCheck",
+            "./api/opencode_check",
+            "opencodeBadgeHtml(n)",
+        ):
+            self.assertIn(marker, manager.INDEX_HTML)
+        self.assertIn("额度用尽", manager.INDEX_HTML)
+        self.assertIn("只看可用", manager.INDEX_HTML)
+
     def test_node_table_contains_latency_country_panel_and_test_action(self) -> None:
         self.assertIn('<th style="width: 125px;">延迟</th>', manager.INDEX_HTML)
-        self.assertIn('colspan="7"', manager.INDEX_HTML)
+        self.assertIn('colspan="8"', manager.INDEX_HTML)
         self.assertIn('class="country-option-input"', manager.INDEX_HTML)
         self.assertIn('${testBtn}', manager.INDEX_HTML)
 
@@ -838,8 +1050,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("2.1.5", manager.APP_VERSION)
-        self.assertEqual("V2.1.5 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("2.2.0", manager.APP_VERSION)
+        self.assertEqual("V2.2.0 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -884,14 +1096,14 @@ class ManagerLogicTests(unittest.TestCase):
     def test_release_workflow_uses_full_patch_version(self) -> None:
         workflow_text = (manager.ROOT_DIR / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
-        self.assertIn("default: v2.1.5", workflow_text)
+        self.assertIn("default: v2.2.0", workflow_text)
         self.assertIn("AimiliVPN V$(tr -d '\\r\\n' < VERSION) 正式版", workflow_text)
         self.assertNotIn("cut -d. -f1,2 VERSION", workflow_text)
 
     def test_latest_release_check_ignores_non_version_name_text(self) -> None:
         release = {
-            "tag_name": "v2.2.0",
-            "name": "AimiliVPN V2.2 正式版",
+            "tag_name": "v2.3.0",
+            "name": "AimiliVPN V2.3 正式版",
             "published_at": "2026-09-01T00:00:00Z",
             "draft": False,
             "prerelease": False,
@@ -901,18 +1113,18 @@ class ManagerLogicTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["update_available"])
-        self.assertEqual("2.2.0", result["latest_version"])
-        self.assertEqual("v2.2.0", result["latest_tag"])
+        self.assertEqual("2.3.0", result["latest_version"])
+        self.assertEqual("v2.3.0", result["latest_tag"])
         self.assertEqual(
-            "https://github.com/baoweise-bot/aimili-vpngate/releases/tag/v2.2.0",
+            "https://github.com/askfname/aimili-vpngate/releases/tag/v2.3.0",
             result["release_url"],
         )
         fetch_mock.assert_called_once_with(manager.GITHUB_LATEST_RELEASE_API, True)
 
     def test_latest_release_check_reports_current_formal_version(self) -> None:
         release = {
-            "tag_name": "v2.1.5",
-            "name": "AimiliVPN V2.1.5 正式版",
+            "tag_name": "v2.2.0",
+            "name": "AimiliVPN V2.2.0 正式版",
             "draft": False,
             "prerelease": False,
         }
@@ -920,7 +1132,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V2.1.5 正式版", result["current_version_label"])
+        self.assertEqual("V2.2.0 正式版", result["current_version_label"])
 
     def test_latest_release_check_reports_source_update_command(self) -> None:
         release = {"tag_name": "v2.2.0", "draft": False, "prerelease": False}
