@@ -1275,12 +1275,51 @@ class ManagerLogicTests(unittest.TestCase):
         cookie = handler.build_session_cookie("tok123", 3600)
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Lax", cookie)
-        self.assertIn("Path=/EJsW2EeBo9lY/", cookie)
+        self.assertIn("Path=/;", cookie)
         self.assertNotIn("Secure", cookie)
 
         handler.headers = {"X-Forwarded-Proto": "https"}
         cookie_secure = handler.build_session_cookie("tok123", 3600)
         self.assertIn("; Secure", cookie_secure)
+
+    def test_session_cookie_compatible_with_reverse_proxy_subpath(self) -> None:
+        handler = mock.MagicMock(spec=manager.Handler)
+        handler.get_secret_path.return_value = "aimili"
+        handler.headers = {"X-Forwarded-Proto": "https"}
+        handler.is_https = manager.Handler.is_https.__get__(handler)
+        handler.build_session_cookie = manager.Handler.build_session_cookie.__get__(handler)
+        
+        cookie = handler.build_session_cookie("reverse_proxy_tok", 3600)
+        # 验证 Cookie 路径为根路径，确保能够被 /aimili-ui/ 等反代子路径访问匹配
+        self.assertIn("Path=/;", cookie)
+        self.assertIn("; Secure", cookie)
+        self.assertIn("SameSite=Lax", cookie)
+
+    def test_is_authorized_with_multiple_session_cookies(self) -> None:
+        handler = mock.MagicMock(spec=manager.Handler)
+        handler.headers = {"Cookie": "session=old_invalid_token; session=valid_session_token_999"}
+        handler.extract_session_tokens = manager.Handler.extract_session_tokens.__get__(handler)
+        handler.extract_session_token = manager.Handler.extract_session_token.__get__(handler)
+        handler.is_authorized = manager.Handler.is_authorized.__get__(handler)
+        
+        manager.active_sessions.clear()
+        manager.active_sessions["valid_session_token_999"] = time.time() + 3600
+        
+        self.assertTrue(handler.is_authorized())
+        self.assertEqual("old_invalid_token", handler.extract_session_token())
+        self.assertEqual(["old_invalid_token", "valid_session_token_999"], handler.extract_session_tokens())
+
+    def test_build_clear_cookies_clears_root_and_secret_path(self) -> None:
+        handler = mock.MagicMock(spec=manager.Handler)
+        handler.get_secret_path.return_value = "aimili"
+        handler.headers = {}
+        handler.is_https = manager.Handler.is_https.__get__(handler)
+        handler.build_clear_cookies = manager.Handler.build_clear_cookies.__get__(handler)
+        
+        cookies = handler.build_clear_cookies()
+        self.assertEqual(2, len(cookies))
+        self.assertTrue(any("Path=/;" in c for c in cookies))
+        self.assertTrue(any("Path=/aimili/;" in c for c in cookies))
 
     def test_purge_expired_sessions_caps_maximum_sessions(self) -> None:
         manager.active_sessions.clear()

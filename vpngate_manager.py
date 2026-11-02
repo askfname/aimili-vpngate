@@ -7741,7 +7741,14 @@ async function saveCredentials(e) {
         setTimeout(() => {
           const protocol = window.location.protocol;
           const host = formatUrlHost(window.location.hostname);
-          window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
+          const currentPort = window.location.port;
+          const isDirectPortAccess = currentPort === String(port) || (!currentPort && (port === 80 || port === 443));
+          if (isDirectPortAccess) {
+            window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
+          } else {
+            // 反向代理场景下不强加后端监听端口，保持在当前代理前缀下重新加载
+            window.location.reload();
+          }
         }, 4000);
       } else {
         successDiv.textContent = data.reauth_required ? "账号密码保存成功，请重新登录..." : "账号密码保存成功，已即时生效！";
@@ -8375,21 +8382,29 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def build_session_cookie(self, token: str, max_age: int) -> str:
-        # 构造带安全标志的 Session Cookie
-        secret_path = self.get_secret_path()
-        cookie_path = f"/{secret_path}/" if secret_path else "/"
+        # 构造 Session Cookie，统一使用根路径以兼容各类反向代理不同子路径映射与直连访问
         secure = "; Secure" if self.is_https() else ""
-        return f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
+        return f"session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
 
     def build_clear_cookie(self) -> str:
-        # 构造清除 Session 的过期 Cookie
-        secret_path = self.get_secret_path()
-        cookie_path = f"/{secret_path}/" if secret_path else "/"
+        # 构造清除根路径 Session 的过期 Cookie
         secure = "; Secure" if self.is_https() else ""
-        return f"session=; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT{secure}"
+        return f"session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT{secure}"
+
+    def build_clear_cookies(self) -> list[str]:
+        # 构造清除所有路径（根路径及历史特定后缀路径）Session 的过期 Cookie 列表
+        secure = "; Secure" if self.is_https() else ""
+        secret_path = self.get_secret_path()
+        cookies = [
+            f"session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT{secure}"
+        ]
+        if secret_path:
+            cookies.append(
+                f"session=; Path=/{secret_path}/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT{secure}"
+            )
+        return cookies
 
     def extract_session_token(self) -> str | None:
-        # 安全解析 Cookie 中的 session 标识
         cookie_header = self.headers.get("Cookie", "")
         if not cookie_header:
             return None
@@ -8397,9 +8412,25 @@ class Handler(BaseHTTPRequestHandler):
             item = item.strip()
             if "=" in item:
                 k, v = item.split("=", 1)
-                if k.strip() == "session":
+                if k.strip() in ("session", "aimilivpn_session"):
                     return v.strip().strip('"')
         return None
+
+    def extract_session_tokens(self) -> list[str]:
+        # 解析 Cookie 头中的所有有效 session 令牌
+        cookie_header = self.headers.get("Cookie", "")
+        if not cookie_header:
+            return []
+        tokens = []
+        for item in cookie_header.split(";"):
+            item = item.strip()
+            if "=" in item:
+                k, v = item.split("=", 1)
+                if k.strip() in ("session", "aimilivpn_session"):
+                    val = v.strip().strip('"')
+                    if val and val not in tokens:
+                        tokens.append(val)
+        return tokens
 
     def is_authorized(self) -> bool:
         # 校验会话状态并在凭据发生变更时即时吊销旧会话
@@ -8418,15 +8449,29 @@ class Handler(BaseHTTPRequestHandler):
                 clear_login_rate_limits()
             _last_auth_signature = current_sig
 
-        session_token = self.extract_session_token()
-        if not session_token:
+        session_tokens: list[str] = []
+        single_token = self.extract_session_token()
+        if isinstance(single_token, str) and single_token:
+            session_tokens.append(single_token)
+        if hasattr(self, "extract_session_tokens"):
+            try:
+                all_tokens = self.extract_session_tokens()
+                if isinstance(all_tokens, (list, tuple)):
+                    for t in all_tokens:
+                        if isinstance(t, str) and t and t not in session_tokens:
+                            session_tokens.append(t)
+            except Exception:
+                pass
+
+        if not session_tokens:
             return False
 
         purge_expired_sessions()
         with lock:
-            exp_time = active_sessions.get(session_token)
-            if exp_time is not None and exp_time > time.time():
-                return True
+            for token in session_tokens:
+                exp_time = active_sessions.get(token)
+                if exp_time is not None and exp_time > time.time():
+                    return True
         return False
 
     def validate_path(self) -> str:
@@ -8733,6 +8778,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("X-Frame-Options", "DENY")
                 self.send_header("Referrer-Policy", "no-referrer")
                 self.send_header("Set-Cookie", self.build_session_cookie(token, SESSION_TTL_SECONDS))
+                secret_path = self.get_secret_path()
+                if secret_path:
+                    secure = "; Secure" if self.is_https() else ""
+                    self.send_header("Set-Cookie", f"session=; Path=/{secret_path}/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT{secure}")
                 self.end_headers()
                 self.wfile.write(body)
             else:
@@ -8754,8 +8803,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path == "/api/logout":
             try:
-                session_token = self.extract_session_token()
-                if session_token:
+                for session_token in self.extract_session_tokens():
                     with lock:
                         active_sessions.pop(session_token, None)
                 body = json.dumps({"ok": True}).encode("utf-8")
@@ -8766,7 +8814,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("X-Frame-Options", "DENY")
                 self.send_header("Referrer-Policy", "no-referrer")
-                self.send_header("Set-Cookie", self.build_clear_cookie())
+                for cookie in self.build_clear_cookies():
+                    self.send_header("Set-Cookie", cookie)
                 self.end_headers()
                 self.wfile.write(body)
             except Exception as exc:
