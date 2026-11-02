@@ -664,6 +664,115 @@ def read_nodes() -> list[dict[str, Any]]:
         return []
     return [item for item in raw if isinstance(item, dict)]
 
+# VPNGate 常见国家代码与名称映射
+COUNTRY_CODE_TO_NAMES: dict[str, tuple[str, str]] = {
+    "AE": ("United Arab Emirates", "阿联酋"),
+    "AR": ("Argentina", "阿根廷"),
+    "AT": ("Austria", "奥地利"),
+    "AU": ("Australia", "澳大利亚"),
+    "BE": ("Belgium", "比利时"),
+    "BR": ("Brazil", "巴西"),
+    "CA": ("Canada", "加拿大"),
+    "CH": ("Switzerland", "瑞士"),
+    "CL": ("Chile", "智利"),
+    "CN": ("China", "中国"),
+    "CO": ("Colombia", "哥伦比亚"),
+    "CZ": ("Czech Republic", "捷克"),
+    "DE": ("Germany", "德国"),
+    "DK": ("Denmark", "丹麦"),
+    "EG": ("Egypt", "埃及"),
+    "ES": ("Spain", "西班牙"),
+    "FI": ("Finland", "芬兰"),
+    "FR": ("France", "法国"),
+    "GB": ("United Kingdom", "英国"),
+    "GE": ("Georgia", "格鲁吉亚"),
+    "GR": ("Greece", "希腊"),
+    "HK": ("Hong Kong", "香港"),
+    "HU": ("Hungary", "匈牙利"),
+    "ID": ("Indonesia", "印度尼西亚"),
+    "IE": ("Ireland", "爱尔兰"),
+    "IL": ("Israel", "以色列"),
+    "IN": ("India", "印度"),
+    "IQ": ("Iraq", "伊拉克"),
+    "IR": ("Iran", "伊朗"),
+    "IS": ("Iceland", "冰岛"),
+    "IT": ("Italy", "意大利"),
+    "JP": ("Japan", "日本"),
+    "KH": ("Cambodia", "柬埔寨"),
+    "KR": ("Korea Republic of", "韩国"),
+    "KZ": ("Kazakhstan", "哈萨克斯坦"),
+    "LU": ("Luxembourg", "卢森堡"),
+    "MN": ("Mongolia", "蒙古"),
+    "MO": ("Macao", "澳门"),
+    "MX": ("Mexico", "墨西哥"),
+    "MY": ("Malaysia", "马来西亚"),
+    "NL": ("Netherlands", "荷兰"),
+    "NO": ("Norway", "挪威"),
+    "NZ": ("New Zealand", "新西兰"),
+    "PH": ("Philippines", "菲律宾"),
+    "PL": ("Poland", "波兰"),
+    "PT": ("Portugal", "葡萄牙"),
+    "RO": ("Romania", "罗马尼亚"),
+    "RU": ("Russian Federation", "俄罗斯"),
+    "SA": ("Saudi Arabia", "沙特阿拉伯"),
+    "SE": ("Sweden", "瑞典"),
+    "SG": ("Singapore", "新加坡"),
+    "TH": ("Thailand", "泰国"),
+    "TR": ("Turkey", "土耳其"),
+    "TW": ("Taiwan", "台湾"),
+    "UA": ("Ukraine", "乌克兰"),
+    "US": ("United States", "美国"),
+    "VN": ("Viet Nam", "越南"),
+    "ZA": ("South Africa", "南非"),
+}
+
+def get_available_countries(nodes: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    # 统计当前节点列表中各国家的节点数量
+    active_nodes = nodes if nodes is not None else read_nodes()
+    counts: dict[str, int] = {}
+    node_names: dict[str, str] = {}
+    for n in active_nodes:
+        code = str(n.get("country_short") or "").strip().upper()
+        if re.fullmatch(r"[A-Z]{2}", code):
+            counts[code] = counts.get(code, 0) + 1
+            if code not in node_names:
+                cname = str(n.get("country") or "").strip()
+                if cname:
+                    node_names[code] = vpn_utils.COUNTRY_TRANSLATIONS.get(cname, cname)
+
+    # 汇总基础目录和当前出现的国家
+    country_map: dict[str, dict[str, Any]] = {}
+    for code, (en_name, zh_name) in COUNTRY_CODE_TO_NAMES.items():
+        country_map[code] = {
+            "code": code,
+            "name": zh_name,
+            "en_name": en_name,
+            "count": counts.get(code, 0),
+        }
+
+    # 补充节点列表中存在但预设目录中没有包含的国家
+    for code, count in counts.items():
+        if code not in country_map:
+            name = node_names.get(code) or code
+            country_map[code] = {
+                "code": code,
+                "name": name,
+                "en_name": name,
+                "count": count,
+            }
+
+    # 排序：有节点的排在前面（按节点数降序），无节点的排在后面；同级按中文名称排序
+    result = list(country_map.values())
+    result.sort(
+        key=lambda item: (
+            0 if item["count"] > 0 else 1,
+            -item["count"],
+            item["name"],
+            item["code"],
+        )
+    )
+    return result
+
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
     state = read_json(STATE_FILE, {})
@@ -705,6 +814,7 @@ def get_state() -> dict[str, Any]:
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["discovery_countries"] = normalize_discovery_countries(ui_cfg.get("discovery_countries"))
+    state["available_countries"] = get_available_countries()
     state["fav_fail_fallback"] = False
     state["opencode_model"] = str(ui_cfg.get("opencode_model") or "")
     
@@ -1916,6 +2026,10 @@ def normalize_routing_country(value: Any, nodes: list[dict[str, Any]] | None = N
         if not re.fullmatch(r"[A-Z]{2}", code):
             continue
         if normalized_country_name(node.get("country")).casefold() == normalized_target:
+            return code
+    # 从全量国家目录中匹配国家名称
+    for code, (en_name, zh_name) in COUNTRY_CODE_TO_NAMES.items():
+        if zh_name.casefold() == normalized_target or en_name.casefold() == normalized_target:
             return code
     return target
 
@@ -4745,6 +4859,14 @@ INDEX_HTML = r"""<!doctype html>
       font-variant-numeric: tabular-nums;
     }
 
+    .country-option-zero {
+      opacity: 0.65;
+    }
+
+    .country-option-zero:hover {
+      opacity: 1;
+    }
+
     .country-filter-footer {
       padding: 8px;
       border-top: 1px solid var(--border-color);
@@ -6219,6 +6341,22 @@ function updateCountryFilterLabel() {
 function updateCountryFilter() {
   syncDiscoveryCountriesFromState();
   const countries = new Map();
+
+  // 先从服务端全量国家目录初始化（确保所有支持的国家选项永远存在，不丢失）
+  if (Array.isArray(state.available_countries)) {
+    state.available_countries.forEach(item => {
+      if (!item || !item.code) return;
+      const code = String(item.code).trim().toUpperCase();
+      if (!/^[A-Z]{2}$/.test(code)) return;
+      countries.set(code, {
+        code,
+        name: item.name || translateCountry(code) || code,
+        count: 0,
+      });
+    });
+  }
+
+  // 根据当前节点列表累加统计节点数
   nodes.forEach(node => {
     if (!node) return;
     const code = String(node.country_short || "").trim().toUpperCase();
@@ -6229,22 +6367,34 @@ function updateCountryFilter() {
       count: 0,
     };
     current.count += 1;
+    if (!current.name || current.name === code) {
+      current.name = translateCountry(node.country) || code;
+    }
     countries.set(code, current);
   });
+
+  // 确保用户已选中的国家代码保留在选项中
   selectedDiscoveryCountries.forEach(code => {
     if (!countries.has(code)) {
-      countries.set(code, { code, name: code, count: 0 });
+      countries.set(code, { code, name: translateCountry(code) || code, count: 0 });
     }
   });
-  const options = Array.from(countries.values()).sort((a, b) =>
-    a.name.localeCompare(b.name, "zh-CN") || a.code.localeCompare(b.code)
-  );
-  const signature = JSON.stringify(options);
+
+  // 排序：有节点的国家排在前面（按节点数降序），无节点的排在后面；同级按中文名称排序
+  const options = Array.from(countries.values()).sort((a, b) => {
+    const aHas = a.count > 0 ? 1 : 0;
+    const bHas = b.count > 0 ? 1 : 0;
+    if (aHas !== bHas) return bHas - aHas;
+    if (a.count !== b.count) return b.count - a.count;
+    return a.name.localeCompare(b.name, "zh-CN") || a.code.localeCompare(b.code);
+  });
+
+  const signature = JSON.stringify(options.map(o => [o.code, o.count, selectedDiscoveryCountries.has(o.code)]));
   if (signature !== countryFilterSignature) {
     const container = $("country_filter_options");
     container.innerHTML = options.length
       ? options.map(item => `
-          <label class="country-option">
+          <label class="country-option ${item.count === 0 ? "country-option-zero" : ""}">
             <input
               class="country-option-input"
               type="checkbox"
@@ -6286,16 +6436,35 @@ function toggleDiscoveryCountry(input) {
   render();
 }
 
-function clearDiscoveryCountries(event) {
+async function clearDiscoveryCountries(event) {
   if (event) event.stopPropagation();
   selectedDiscoveryCountries.clear();
-  discoveryCountriesDirty = true;
+  discoveryCountriesDirty = false;
   document.querySelectorAll(".country-option-input").forEach(input => {
     input.checked = false;
   });
   currentPage = 1;
   updateCountryFilterLabel();
   render();
+  // 同步清空服务端持久化的国家筛选配置，避免刷新或重启后再次丢失节点
+  try {
+    const response = await fetchWithTimeout("./api/refresh_nodes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ discovery_countries: [] }),
+    }, 15000);
+    const result = await readJsonResponse(response, "重置国家筛选失败");
+    if (result && result.ok) {
+      state.discovery_countries = [];
+      if (Array.isArray(result.available_countries)) {
+        state.available_countries = result.available_countries;
+      }
+      updateCountryFilter();
+      startRefreshPolling();
+    }
+  } catch (err) {
+    console.warn("同步清空国家筛选范围失败:", err);
+  }
 }
 
 function matchesCountryAndIpType(n){
@@ -7426,20 +7595,46 @@ function populateRoutingCountries() {
   const select = $("net_force_country");
   if (!select) return;
   const countMap = {};
+
+  // 先从全量国家目录初始化，确保所有国家在固定地区设置中均可选
+  if (Array.isArray(state.available_countries)) {
+    state.available_countries.forEach(item => {
+      if (!item || !item.code) return;
+      const code = String(item.code).trim().toUpperCase();
+      if (/^[A-Z]{2}$/.test(code)) {
+        countMap[code] = {
+          name: item.name || translateCountry(code) || code,
+          count: 0,
+        };
+      }
+    });
+  }
+
   nodes.forEach(n => {
     const code = String(n.country_short || "").trim().toUpperCase();
     const c = translateCountry(n.country);
-    if (/^[A-Z]{2}$/.test(code) && c) {
-      const current = countMap[code] || {name: c, count: 0};
+    if (/^[A-Z]{2}$/.test(code)) {
+      const current = countMap[code] || {name: c || code, count: 0};
       current.count += 1;
+      if (c && (!current.name || current.name === code)) {
+        current.name = c;
+      }
       countMap[code] = current;
     }
   });
   
-  const countries = Object.keys(countMap).sort((a, b) => countMap[a].name.localeCompare(countMap[b].name, "zh-CN"));
+  const countries = Object.keys(countMap).sort((a, b) => {
+    const aHas = countMap[a].count > 0 ? 1 : 0;
+    const bHas = countMap[b].count > 0 ? 1 : 0;
+    if (aHas !== bHas) return bHas - aHas;
+    if (countMap[a].count !== countMap[b].count) return countMap[b].count - countMap[a].count;
+    return countMap[a].name.localeCompare(countMap[b].name, "zh-CN");
+  });
+
   let html = '<option value="">请选择要锁定的国家...</option>';
   countries.forEach(code => {
-    html += `<option value="${esc(code)}">${esc(countryFlag(code))} ${esc(countMap[code].name)} (${countMap[code].count}个节点)</option>`;
+    const nodeCountText = countMap[code].count > 0 ? ` (${countMap[code].count}个节点)` : ' (当前无可用节点)';
+    html += `<option value="${esc(code)}">${esc(countryFlag(code))} ${esc(countMap[code].name)}${nodeCountText}</option>`;
   });
   select.innerHTML = html;
   
@@ -8819,12 +9014,14 @@ class Handler(BaseHTTPRequestHandler):
                     discovery_countries = normalize_discovery_countries(
                         load_ui_config().get("discovery_countries")
                     )
+                available = get_available_countries()
                 if maintenance_lock.locked():
                     self.send_json({
                         "ok": True,
                         "message": "节点维护任务正在运行，国家范围已保存并将在下一轮生效",
                         "running": True,
                         "discovery_countries": discovery_countries,
+                        "available_countries": available,
                     })
                 else:
                     threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
@@ -8833,6 +9030,7 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "已在后台启动节点更新流程",
                         "running": True,
                         "discovery_countries": discovery_countries,
+                        "available_countries": available,
                     })
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)

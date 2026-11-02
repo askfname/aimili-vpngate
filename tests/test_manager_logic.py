@@ -830,6 +830,51 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("official_https", state["last_fetch_source"])
         self.assertIn("保留 0 个", state["last_fetch_message"])
 
+    def test_get_available_countries_contains_catalog_and_counts(self) -> None:
+        mock_nodes = [
+            {"country_short": "JP", "country": "Japan"},
+            {"country_short": "JP", "country": "Japan"},
+            {"country_short": "US", "country": "United States"},
+        ]
+        available = manager.get_available_countries(mock_nodes)
+        self.assertGreaterEqual(len(available), 58)
+        
+        counts = {item["code"]: item["count"] for item in available}
+        self.assertEqual(2, counts.get("JP"))
+        self.assertEqual(1, counts.get("US"))
+        self.assertEqual(0, counts.get("KR"))
+        self.assertEqual(0, counts.get("DE"))
+        
+        # 验证有节点的国家排在最前
+        self.assertEqual("JP", available[0]["code"])
+        self.assertEqual("US", available[1]["code"])
+
+    def test_state_includes_available_countries(self) -> None:
+        state = manager.get_state()
+        self.assertIn("available_countries", state)
+        self.assertIsInstance(state["available_countries"], list)
+        self.assertGreaterEqual(len(state["available_countries"]), 58)
+        first = state["available_countries"][0]
+        self.assertIn("code", first)
+        self.assertIn("name", first)
+        self.assertIn("count", first)
+
+    def test_normalize_routing_country_fallback_to_catalog(self) -> None:
+        self.assertEqual("US", manager.normalize_routing_country("美国", []))
+        self.assertEqual("US", manager.normalize_routing_country("United States", []))
+        self.assertEqual("DE", manager.normalize_routing_country("德国", []))
+        self.assertEqual("DE", manager.normalize_routing_country("Germany", []))
+        self.assertEqual("JP", manager.normalize_routing_country("JP", []))
+
+    def test_clear_discovery_countries_clears_state_and_config(self) -> None:
+        manager.persist_discovery_countries(["JP", "US"])
+        self.assertEqual(["JP", "US"], manager.load_ui_config()["discovery_countries"])
+        
+        cleared = manager.persist_discovery_countries([])
+        self.assertEqual([], cleared)
+        self.assertEqual([], manager.load_ui_config()["discovery_countries"])
+        self.assertEqual([], manager.get_state()["discovery_countries"])
+
     def test_opencode_models_preserve_listing_order(self) -> None:
         payload = {
             "data": [
