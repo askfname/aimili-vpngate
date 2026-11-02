@@ -10,6 +10,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -169,6 +170,8 @@ class ManagerLogicTests(unittest.TestCase):
         manager.background_refill_thread = None
         manager.background_refill_cancel_event.clear()
         manager.active_sessions.clear()
+        manager.clear_login_rate_limits()
+        manager._last_auth_signature = ""
         manager.opencode_check_thread = None
         manager.opencode_check_cancel_event.clear()
         if manager.opencode_check_lock.locked():
@@ -1086,6 +1089,12 @@ class ManagerLogicTests(unittest.TestCase):
             self.assertIn(marker, manager.INDEX_HTML)
         self.assertIn("额度用尽", manager.INDEX_HTML)
         self.assertIn("只看可用", manager.INDEX_HTML)
+        # 加载动画统一用 .spin 类锚定字形墨迹中心旋转，避免视觉偏移
+        self.assertIn(".spin {\n      animation: spin 1s linear infinite;\n      transform-box: fill-box;\n      transform-origin: center;\n    }", manager.INDEX_HTML)
+        self.assertEqual(4, manager.INDEX_HTML.count('class="spin"'))
+        # 工具栏按钮加载态与其余加载器使用同一居中的圆环扫弧字形
+        self.assertEqual(3, manager.INDEX_HTML.count('stroke="currentColor" stroke-opacity="0.2"'))
+        self.assertIn('class="spin" style="width:16px; height:16px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">', manager.INDEX_HTML)
 
     def test_node_table_contains_latency_country_panel_and_test_action(self) -> None:
         self.assertIn('<th style="width: 125px;">延迟</th>', manager.INDEX_HTML)
@@ -1162,6 +1171,151 @@ class ManagerLogicTests(unittest.TestCase):
 
         self.assertEqual(1, removed)
         self.assertEqual({"active": 101.0}, manager.active_sessions)
+
+    def test_login_rate_limiting_and_lockout(self) -> None:
+        client_ip = "192.168.1.100"
+        manager.clear_login_rate_limits()
+
+        allowed, _ = manager.check_login_rate_limit(client_ip)
+        self.assertTrue(allowed)
+
+        for _ in range(4):
+            fails, lockout = manager.record_login_failure(client_ip)
+            self.assertEqual(0, lockout)
+
+        allowed, _ = manager.check_login_rate_limit(client_ip)
+        self.assertTrue(allowed)
+
+        fails, lockout = manager.record_login_failure(client_ip)
+        self.assertEqual(5, fails)
+        self.assertEqual(manager.LOGIN_LOCKOUT_SECONDS, lockout)
+
+        allowed, remaining = manager.check_login_rate_limit(client_ip)
+        self.assertFalse(allowed)
+        self.assertGreater(remaining, 0)
+
+        manager.record_login_success(client_ip)
+        allowed, _ = manager.check_login_rate_limit(client_ip)
+        self.assertTrue(allowed)
+
+    def test_credential_change_invalidates_active_sessions(self) -> None:
+        manager.clear_login_rate_limits()
+        manager.active_sessions.clear()
+        manager._last_auth_signature = ""
+
+        auth_file = manager.DATA_DIR / "ui_auth.json"
+        manager.write_json(auth_file, {"username": "admin", "password": "password123"})
+
+        handler = mock.MagicMock(spec=manager.Handler)
+        handler.headers = {"Cookie": "session=valid_token_123"}
+        handler.extract_session_token = manager.Handler.extract_session_token.__get__(handler)
+        handler.is_authorized = manager.Handler.is_authorized.__get__(handler)
+
+        manager.active_sessions["valid_token_123"] = time.time() + 3600
+
+        self.assertTrue(handler.is_authorized())
+
+        manager.write_json(auth_file, {"username": "admin", "password": "new_password456"})
+
+        self.assertFalse(handler.is_authorized())
+        self.assertNotIn("valid_token_123", manager.active_sessions)
+
+    def test_session_cookie_generation_security_flags(self) -> None:
+        handler = mock.MagicMock(spec=manager.Handler)
+        handler.get_secret_path.return_value = "EJsW2EeBo9lY"
+
+        handler.headers = {}
+        handler.is_https = manager.Handler.is_https.__get__(handler)
+        handler.build_session_cookie = manager.Handler.build_session_cookie.__get__(handler)
+        cookie = handler.build_session_cookie("tok123", 3600)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Lax", cookie)
+        self.assertIn("Path=/EJsW2EeBo9lY/", cookie)
+        self.assertNotIn("Secure", cookie)
+
+        handler.headers = {"X-Forwarded-Proto": "https"}
+        cookie_secure = handler.build_session_cookie("tok123", 3600)
+        self.assertIn("; Secure", cookie_secure)
+
+    def test_purge_expired_sessions_caps_maximum_sessions(self) -> None:
+        manager.active_sessions.clear()
+        now = time.time()
+        for i in range(manager.MAX_ACTIVE_SESSIONS + 50):
+            manager.active_sessions[f"tok_{i}"] = now + 1000 + i
+
+        manager.purge_expired_sessions(now=now)
+        self.assertLessEqual(len(manager.active_sessions), manager.MAX_ACTIVE_SESSIONS)
+
+    def test_api_login_endpoint_behavior(self) -> None:
+        import io
+        manager.clear_login_rate_limits()
+        manager.active_sessions.clear()
+        manager._last_auth_signature = ""
+        orig_delay = manager.LOGIN_FAIL_PENALTY_DELAY
+        manager.LOGIN_FAIL_PENALTY_DELAY = 0.0
+
+        try:
+            auth_file = manager.DATA_DIR / "ui_auth.json"
+            manager.write_json(auth_file, {"username": "admin", "password": "password123", "secret_path": "test_path"})
+
+            def make_login_request(body_dict, ip="192.168.1.101"):
+                body_bytes = json.dumps(body_dict).encode("utf-8")
+                handler = mock.MagicMock(spec=manager.Handler)
+                handler.path = "/test_path/api/login"
+                handler.client_address = (ip, 12345)
+                handler.headers = {"Content-Length": str(len(body_bytes))}
+                handler.rfile = io.BytesIO(body_bytes)
+                handler.wfile = io.BytesIO()
+                handler.get_secret_path = manager.Handler.get_secret_path.__get__(handler)
+                handler.validate_path = manager.Handler.validate_path.__get__(handler)
+                handler.get_client_ip = manager.Handler.get_client_ip.__get__(handler)
+                handler.is_https = manager.Handler.is_https.__get__(handler)
+                handler.build_session_cookie = manager.Handler.build_session_cookie.__get__(handler)
+                handler.read_request_body = manager.Handler.read_request_body.__get__(handler)
+                handler.read_json_body = manager.Handler.read_json_body.__get__(handler)
+                
+                sent_status = []
+                sent_headers = {}
+                def mock_send_response(code):
+                    sent_status.append(code)
+                def mock_send_header(k, v):
+                    sent_headers[k] = v
+                def mock_send_bytes(body, ctype, status=200):
+                    sent_status.append(status)
+                def mock_send_json(data, status=200):
+                    sent_status.append(status)
+                    handler.sent_data = data
+
+                handler.send_response = mock_send_response
+                handler.send_header = mock_send_header
+                handler.end_headers = lambda: None
+                handler.send_bytes = mock_send_bytes
+                handler.send_json = mock_send_json
+                handler.sent_headers = sent_headers
+                handler.sent_status = sent_status
+
+                manager.Handler.do_POST(handler)
+                return handler
+
+            h_ok = make_login_request({"username": "admin", "password": "password123"})
+            self.assertEqual([200], h_ok.sent_status)
+            self.assertIn("session=", h_ok.sent_headers.get("Set-Cookie", ""))
+            self.assertEqual(1, len(manager.active_sessions))
+
+            h_fail = make_login_request({"username": "admin", "password": "wrongpassword"})
+            self.assertEqual([403], h_fail.sent_status)
+            self.assertIn("剩余尝试次数", h_fail.sent_data.get("error", ""))
+
+            for _ in range(3):
+                make_login_request({"username": "admin", "password": "wrongpassword"})
+            h_locked = make_login_request({"username": "admin", "password": "wrongpassword"})
+            self.assertEqual([429], h_locked.sent_status)
+            self.assertIn("临时锁定", h_locked.sent_data.get("error", ""))
+
+            h_locked2 = make_login_request({"username": "admin", "password": "password123"})
+            self.assertEqual([429], h_locked2.sent_status)
+        finally:
+            manager.LOGIN_FAIL_PENALTY_DELAY = orig_delay
 
     def test_web_log_reader_only_returns_recent_valid_entries(self) -> None:
         log_file = manager.DATA_DIR / "logs" / "current.json"

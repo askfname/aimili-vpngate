@@ -191,6 +191,17 @@ background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
 background_refill_thread: threading.Thread | None = None
 active_sessions: dict[str, float] = {}
+SESSION_TTL_SECONDS = 7 * 24 * 3600
+MAX_ACTIVE_SESSIONS = 500
+_last_auth_signature = ""
+
+login_rate_lock = threading.Lock()
+login_failed_attempts: dict[str, dict[str, Any]] = {}
+MAX_LOGIN_FAILURES = 5
+LOGIN_LOCKOUT_SECONDS = 900
+LOGIN_WINDOW_SECONDS = 600
+LOGIN_FAIL_PENALTY_DELAY = 0.5
+MAX_TRACKED_IPS = 1000
 active_openvpn_process: subprocess.Popen[str] | None = None
 pending_openvpn_process: subprocess.Popen[str] | None = None
 active_connection_cancel_event: threading.Event | None = None
@@ -314,6 +325,58 @@ class ConnectionCancelled(RuntimeError):
 class SourceDeadlineExceeded(TimeoutError):
     pass
 
+def calc_auth_signature(username: str, password: str) -> str:
+    # 计算凭据摘要以检测凭据变更
+    return hashlib.sha256(f"{username}:{password}".encode("utf-8")).hexdigest()
+
+def clear_login_rate_limits() -> None:
+    # 清空登录失败与锁定记录
+    with login_rate_lock:
+        login_failed_attempts.clear()
+
+def check_login_rate_limit(client_ip: str) -> tuple[bool, int]:
+    # 检查客户端 IP 是否处于锁定冷却期
+    now = time.time()
+    with login_rate_lock:
+        if len(login_failed_attempts) > MAX_TRACKED_IPS:
+            stale = [
+                ip for ip, data in login_failed_attempts.items()
+                if data.get("locked_until", 0) <= now and now - data.get("last_attempt", 0) > LOGIN_WINDOW_SECONDS
+            ]
+            for ip in stale:
+                login_failed_attempts.pop(ip, None)
+            if len(login_failed_attempts) > MAX_TRACKED_IPS:
+                oldest = sorted(login_failed_attempts.items(), key=lambda kv: kv[1].get("last_attempt", 0))
+                for ip, _ in oldest[:len(login_failed_attempts) - MAX_TRACKED_IPS]:
+                    login_failed_attempts.pop(ip, None)
+
+        entry = login_failed_attempts.get(client_ip)
+        if entry:
+            locked_until = entry.get("locked_until", 0.0)
+            if locked_until > now:
+                return False, int(max(1.0, locked_until - now))
+    return True, 0
+
+def record_login_failure(client_ip: str) -> tuple[int, int]:
+    # 记录登录失败，超限则触发锁定
+    now = time.time()
+    with login_rate_lock:
+        entry = login_failed_attempts.setdefault(client_ip, {"failures": 0, "locked_until": 0.0, "last_attempt": 0.0})
+        if entry.get("locked_until", 0.0) <= now and now - entry.get("last_attempt", 0.0) > LOGIN_WINDOW_SECONDS:
+            entry["failures"] = 0
+        entry["failures"] = entry.get("failures", 0) + 1
+        entry["last_attempt"] = now
+        fails = entry["failures"]
+        if fails >= MAX_LOGIN_FAILURES:
+            entry["locked_until"] = now + LOGIN_LOCKOUT_SECONDS
+            return fails, LOGIN_LOCKOUT_SECONDS
+        return fails, 0
+
+def record_login_success(client_ip: str) -> None:
+    # 登录成功后清除失败计数
+    with login_rate_lock:
+        login_failed_attempts.pop(client_ip, None)
+
 def purge_expired_sessions(now: float | None = None) -> int:
     current_time = time.time() if now is None else now
     with lock:
@@ -323,6 +386,11 @@ def purge_expired_sessions(now: float | None = None) -> int:
         ]
         for token in expired_tokens:
             active_sessions.pop(token, None)
+        if len(active_sessions) > MAX_ACTIVE_SESSIONS:
+            excess = len(active_sessions) - MAX_ACTIVE_SESSIONS
+            sorted_tokens = sorted(active_sessions.items(), key=lambda kv: kv[1])
+            for token, _ in sorted_tokens[:excess]:
+                active_sessions.pop(token, None)
     return len(expired_tokens)
 
 def ensure_dirs() -> None:
@@ -5008,6 +5076,13 @@ INDEX_HTML = r"""<!doctype html>
       to { transform: rotate(360deg); }
     }
 
+    /* 加载动画统一锚定字形墨迹中心旋转，避免依赖 viewBox/盒模型推断导致的视觉偏移 */
+    .spin {
+      animation: spin 1s linear infinite;
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+
     .available {
       background: rgba(16, 185, 129, 0.1);
       color: #34d399;
@@ -5790,7 +5865,7 @@ INDEX_HTML = r"""<!doctype html>
       <!-- 服务列表 -->
       <div id="gateway_services_list" style="display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px;">
         <div style="text-align: center; color: var(--text-secondary); padding: 20px 0;">
-          <svg style="animation: spin 1s linear infinite; width: 20px; height: 20px; display: inline-block; margin-bottom: 8px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>
+          <svg class="spin" style="width: 20px; height: 20px; display: inline-block; margin-bottom: 8px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>
           <div>正在加载系统网关状态...</div>
         </div>
       </div>
@@ -6376,7 +6451,7 @@ function renderOpencodeUI(){
       btn.dataset.mode = mode;
       btn.classList.toggle("running", running);
       btn.innerHTML = running
-        ? `<svg style="animation: spin 1s linear infinite; width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg>停止检测`
+        ? `<svg class="spin" style="width:16px; height:16px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>停止检测`
         : `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>检测 OpenCode`;
     }
     const filteredCount = getFilteredNodes().length;
@@ -6560,7 +6635,7 @@ function render(){
       <div class="active-card" style="background: var(--bg-surface); border-color: var(--warning); box-shadow: 0 0 15px rgba(245, 158, 11, 0.15);">
         <div class="active-card-info">
           <div class="stat-icon-wrapper" style="background: rgba(245, 158, 11, 0.15); border-color: rgba(245, 158, 11, 0.3); width: 48px; height: 48px; border-radius: 12px;">
-            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #f59e0b; width: 24px; height: 24px; animation: spin 2s linear infinite;"><path stroke-linecap="round" stroke-linejoin="round" d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg>
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #f59e0b; width: 24px; height: 24px; animation: spin 2s linear infinite;"><path stroke-linecap="round" stroke-linejoin="round" d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg>
           </div>
           <div class="active-card-details">
             <div class="active-card-title" style="color: var(--text-primary);">
@@ -6726,7 +6801,7 @@ function render(){
       const ipTypeTitle = `${translateIpType(n.ip_type)} · 置信度：${translateConfidence(n.ip_type_confidence)} · 来源：${(n.ip_type_sources || []).join(" + ") || "未知"}`;
       
       const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
-      const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
+      const testSpinner = `<svg class="spin" style="width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
       const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${(isTesting || opencodeRunning) ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
       
@@ -6884,7 +6959,7 @@ function refreshButtonBusy(message = "正在后台更新...") {
   const btn = $("refresh");
   if (!btn) return;
   btn.disabled = true;
-  btn.innerHTML = `<svg style="animation: spin 1s linear infinite; width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg>${esc(message)}`;
+  btn.innerHTML = `<svg class="spin" style="width:16px; height:16px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg>${esc(message)}`;
 }
 
 function refreshButtonIdle() {
@@ -7413,6 +7488,16 @@ async function saveCredentials(e) {
   
   if (!username || (!password && !(state && state.password_set))) {
     errorDivEl.textContent = "用户名不能为空；首次设置时密码不能为空";
+    errorDivEl.style.display = "block";
+    return;
+  }
+  if (password && password.length < 6) {
+    errorDivEl.textContent = "新密码长度至少需要 6 个字符";
+    errorDivEl.style.display = "block";
+    return;
+  }
+  if (!/^[A-Za-z0-9_-]{3,64}$/.test(username)) {
+    errorDivEl.textContent = "用户名需为 3-64 位的英文字母、数字、下划线或减号";
     errorDivEl.style.display = "block";
     return;
   }
@@ -8071,26 +8156,77 @@ class Handler(BaseHTTPRequestHandler):
         ui_cfg = load_ui_config()
         return ui_cfg.get("secret_path", "EJsW2EeBo9lY")
 
+    def get_client_ip(self) -> str:
+        #获取客户端真实 IP（本地反代时采纳 XFF 头）
+        remote_ip = self.client_address[0] if self.client_address else "127.0.0.1"
+        if remote_ip in ("127.0.0.1", "::1", "localhost"):
+            xff = self.headers.get("X-Forwarded-For", "")
+            if xff:
+                client_ip = xff.split(",")[0].strip()
+                if client_ip:
+                    return client_ip
+        return remote_ip
+
+    def is_https(self) -> bool:
+        # 判断当前连接是否基于 HTTPS 或受信任 SSL 反代
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            return True
+        if self.headers.get("X-Forwarded-Scheme", "").lower() == "https":
+            return True
+        if self.headers.get("X-Forwarded-Ssl", "").lower() == "on":
+            return True
+        if hasattr(self, "connection") and hasattr(self.connection, "getpeercert"):
+            return True
+        return False
+
+    def build_session_cookie(self, token: str, max_age: int) -> str:
+        # 构造带安全标志的 Session Cookie
+        secret_path = self.get_secret_path()
+        cookie_path = f"/{secret_path}/" if secret_path else "/"
+        secure = "; Secure" if self.is_https() else ""
+        return f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
+
+    def build_clear_cookie(self) -> str:
+        # 构造清除 Session 的过期 Cookie
+        secret_path = self.get_secret_path()
+        cookie_path = f"/{secret_path}/" if secret_path else "/"
+        secure = "; Secure" if self.is_https() else ""
+        return f"session=; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT{secure}"
+
+    def extract_session_token(self) -> str | None:
+        # 安全解析 Cookie 中的 session 标识
+        cookie_header = self.headers.get("Cookie", "")
+        if not cookie_header:
+            return None
+        for item in cookie_header.split(";"):
+            item = item.strip()
+            if "=" in item:
+                k, v = item.split("=", 1)
+                if k.strip() == "session":
+                    return v.strip().strip('"')
+        return None
+
     def is_authorized(self) -> bool:
+        # 校验会话状态并在凭据发生变更时即时吊销旧会话
+        global _last_auth_signature
         ui_cfg = load_ui_config()
-        pwd = ui_cfg.get("password")
+        pwd = str(ui_cfg.get("password") or "")
+        uname = str(ui_cfg.get("username") or "admin")
         if not pwd:
             print("[Auth] 管理后台密码为空，已拒绝访问。请检查 ui_auth.json。", flush=True)
             return False
-        
-        cookie_header = self.headers.get("Cookie", "")
-        cookies = {}
-        if cookie_header:
-            for item in cookie_header.split(";"):
-                item = item.strip()
-                if "=" in item:
-                    k, v = item.split("=", 1)
-                    cookies[k.strip()] = v.strip()
-        
-        session_token = cookies.get("session")
+
+        current_sig = calc_auth_signature(uname, pwd)
+        with lock:
+            if _last_auth_signature and _last_auth_signature != current_sig:
+                active_sessions.clear()
+                clear_login_rate_limits()
+            _last_auth_signature = current_sig
+
+        session_token = self.extract_session_token()
         if not session_token:
             return False
-            
+
         purge_expired_sessions()
         with lock:
             exp_time = active_sessions.get(session_token)
@@ -8123,6 +8259,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(body)
 
@@ -8345,60 +8484,94 @@ class Handler(BaseHTTPRequestHandler):
         if effective_path == "": return
         
         if effective_path == "/api/login":
+            client_ip = self.get_client_ip()
+            allowed, remaining_sec = check_login_rate_limit(client_ip)
+            if not allowed:
+                self.send_json(
+                    {"ok": False, "error": f"登录失败次数过多，该 IP 已被临时锁定，请在 {remaining_sec} 秒后重试"},
+                    HTTPStatus.TOO_MANY_REQUESTS
+                )
+                return
+
             try:
                 payload = self.read_json_body()
-                input_pwd = str(payload.get("password") or "")
-                input_uname = str(payload.get("username") or "")
-                
-                ui_cfg = load_ui_config()
-                expected_pwd = ui_cfg.get("password", "")
-                expected_uname = ui_cfg.get("username", "admin")
-                
-                password_matches = bool(expected_pwd) and secrets.compare_digest(input_pwd, str(expected_pwd))
-                username_matches = secrets.compare_digest(input_uname, str(expected_uname))
-                if password_matches and username_matches:
-                    token = uuid.uuid4().hex
-                    purge_expired_sessions()
-                    with lock:
-                        active_sessions[token] = time.time() + 30 * 24 * 3600
-                    body = json.dumps({"ok": True}).encode("utf-8")
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.send_header("Cache-Control", "no-store")
-                    secret_path = self.get_secret_path()
-                    cookie_path = f"/{secret_path}/" if secret_path else "/"
-                    self.send_header("Set-Cookie", f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=2592000")
-                    self.end_headers()
-                    self.wfile.write(body)
-                else:
-                    self.send_json({"ok": False, "error": "用户名或密码不正确，请重新输入"}, HTTPStatus.FORBIDDEN)
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
+            except Exception:
+                self.send_json({"ok": False, "error": "无效的请求格式"}, HTTPStatus.BAD_REQUEST)
+                return
 
-        if effective_path == "/api/logout":
-            try:
-                cookie_header = self.headers.get("Cookie", "")
-                cookies = {}
-                if cookie_header:
-                    for item in cookie_header.split(";"):
-                        item = item.strip()
-                        if "=" in item:
-                            k, v = item.split("=", 1)
-                            cookies[k.strip()] = v.strip()
-                session_token = cookies.get("session")
-                if session_token:
-                    with lock:
-                        active_sessions.pop(session_token, None)
-                secret_path = self.get_secret_path()
-                cookie_path = f"/{secret_path}/" if secret_path else "/"
+            input_uname = str(payload.get("username") or "").strip()
+            input_pwd = str(payload.get("password") or "")
+
+            if not input_uname or not input_pwd:
+                record_login_failure(client_ip)
+                if LOGIN_FAIL_PENALTY_DELAY > 0:
+                    time.sleep(LOGIN_FAIL_PENALTY_DELAY)
+                self.send_json({"ok": False, "error": "用户名和密码不能为空"}, HTTPStatus.BAD_REQUEST)
+                return
+
+            if len(input_uname) > 128 or len(input_pwd) > 256:
+                record_login_failure(client_ip)
+                if LOGIN_FAIL_PENALTY_DELAY > 0:
+                    time.sleep(LOGIN_FAIL_PENALTY_DELAY)
+                self.send_json({"ok": False, "error": "用户名或密码超长"}, HTTPStatus.BAD_REQUEST)
+                return
+
+            ui_cfg = load_ui_config()
+            expected_pwd = str(ui_cfg.get("password") or "")
+            expected_uname = str(ui_cfg.get("username") or "admin")
+
+            password_matches = bool(expected_pwd) and secrets.compare_digest(input_pwd, expected_pwd)
+            username_matches = secrets.compare_digest(input_uname, expected_uname)
+
+            if password_matches and username_matches:
+                record_login_success(client_ip)
+                token = secrets.token_hex(32)
+                purge_expired_sessions()
+                with lock:
+                    active_sessions[token] = time.time() + SESSION_TTL_SECONDS
                 body = json.dumps({"ok": True}).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
-                self.send_header("Set-Cookie", f"session=; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Set-Cookie", self.build_session_cookie(token, SESSION_TTL_SECONDS))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                fails, lockout_sec = record_login_failure(client_ip)
+                if LOGIN_FAIL_PENALTY_DELAY > 0:
+                    time.sleep(LOGIN_FAIL_PENALTY_DELAY)
+                if lockout_sec > 0:
+                    self.send_json(
+                        {"ok": False, "error": f"登录失败次数过多（{fails}次），该 IP 已被临时锁定 15 分钟，请稍后再试"},
+                        HTTPStatus.TOO_MANY_REQUESTS
+                    )
+                else:
+                    remaining_tries = MAX_LOGIN_FAILURES - fails
+                    self.send_json(
+                        {"ok": False, "error": f"用户名或密码不正确，请重新输入（剩余尝试次数: {remaining_tries}）"},
+                        HTTPStatus.FORBIDDEN
+                    )
+            return
+
+        if effective_path == "/api/logout":
+            try:
+                session_token = self.extract_session_token()
+                if session_token:
+                    with lock:
+                        active_sessions.pop(session_token, None)
+                body = json.dumps({"ok": True}).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Set-Cookie", self.build_clear_cookie())
                 self.end_headers()
                 self.wfile.write(body)
             except Exception as exc:
@@ -8420,6 +8593,14 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg = load_ui_config()
                 if not new_username or (not new_password and not ui_cfg.get("password")):
                     self.send_json({"ok": False, "error": "用户名不能为空；首次设置时密码不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                if new_password and len(new_password) < 6:
+                    self.send_json({"ok": False, "error": "新密码长度至少需要 6 个字符"}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                if len(new_username) < 3 or len(new_username) > 64 or not re.match(r"^[A-Za-z0-9_-]+$", new_username):
+                    self.send_json({"ok": False, "error": "用户名需为 3-64 位的英文字母、数字、下划线或减号"}, HTTPStatus.BAD_REQUEST)
                     return
                 
                 try:
@@ -8456,6 +8637,7 @@ class Handler(BaseHTTPRequestHandler):
                     write_json(auth_file, ui_cfg)
                     if reauth_required:
                         active_sessions.clear()
+                        clear_login_rate_limits()
                 
                 restart_needed = (new_port_int != expected_port or new_suffix != expected_suffix)
                 if restart_needed:
