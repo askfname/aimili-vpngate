@@ -4585,7 +4585,7 @@ INDEX_HTML = r"""<!doctype html>
       gap: 12px;
     }
 
-    button, .btn-telegram {
+    button, .btn-telegram, .btn-sponsor {
       height: 38px;
       border: 1px solid var(--border-color);
       border-radius: 8px;
@@ -4622,6 +4622,168 @@ INDEX_HTML = r"""<!doctype html>
       border-color: rgba(43, 162, 223, 0.5);
       color: #2ba2df;
       transform: translateY(-1px);
+    }
+
+    .btn-sponsor {
+      background: rgba(255, 94, 91, 0.12);
+      border: 1px solid rgba(255, 94, 91, 0.3);
+      color: #ff8b89;
+      text-decoration: none;
+    }
+
+    .btn-sponsor:hover {
+      background: rgba(255, 94, 91, 0.22);
+      border-color: rgba(255, 94, 91, 0.5);
+      color: #ffa19f;
+      transform: translateY(-1px);
+    }
+
+    /* Sponsor Banner */
+    .sponsor-banner {
+      position: relative;
+      background: linear-gradient(135deg, rgba(148, 108, 230, 0.08) 0%, rgba(255, 94, 91, 0.08) 100%), #111827;
+      border: 1px solid rgba(148, 108, 230, 0.25);
+      border-radius: 12px;
+      padding: 14px 20px;
+      margin-bottom: 22px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+      transition: opacity 0.25s ease, transform 0.25s ease;
+    }
+
+    .sponsor-banner-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .sponsor-icon-wrapper {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, rgba(148, 108, 230, 0.25) 0%, rgba(255, 94, 91, 0.25) 100%);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      color: #f43f5e;
+      box-shadow: 0 0 12px rgba(244, 63, 94, 0.2);
+    }
+
+    .sponsor-text {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .sponsor-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .sponsor-desc {
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      line-height: 1.45;
+    }
+
+    .sponsor-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    .sponsor-btn {
+      height: 34px;
+      padding: 0 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      cursor: pointer;
+    }
+
+    .afdian-btn {
+      background: linear-gradient(135deg, #946ce6 0%, #7c3aed 100%);
+      color: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      box-shadow: 0 2px 8px rgba(148, 108, 230, 0.35);
+    }
+
+    .afdian-btn:hover {
+      background: linear-gradient(135deg, #a78bfa 0%, #8b5cf6 100%);
+      box-shadow: 0 4px 14px rgba(148, 108, 230, 0.5);
+      color: #ffffff;
+      transform: translateY(-1px);
+    }
+
+    .kofi-btn {
+      background: linear-gradient(135deg, #ff5e5b 0%, #ef4444 100%);
+      color: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      box-shadow: 0 2px 8px rgba(255, 94, 91, 0.35);
+    }
+
+    .kofi-btn:hover {
+      background: linear-gradient(135deg, #ff7b79 0%, #f87171 100%);
+      box-shadow: 0 4px 14px rgba(255, 94, 91, 0.5);
+      color: #ffffff;
+      transform: translateY(-1px);
+    }
+
+    .sponsor-close-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      padding: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      margin-left: 2px;
+    }
+
+    .sponsor-close-btn:hover {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text-primary);
+    }
+
+    @media (max-width: 860px) {
+      .sponsor-banner {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 14px;
+        padding: 14px 16px;
+      }
+      .sponsor-actions {
+        width: 100%;
+        justify-content: flex-start;
+        flex-wrap: wrap;
+      }
+      .sponsor-close-btn {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+      }
     }
 
     .btn-primary {
@@ -5507,6 +5669,7 @@ INDEX_HTML = r"""<!doctype html>
       }
       .btn-group > button,
       .btn-group > .btn-telegram,
+      .btn-group > .btn-sponsor,
       .btn-group > .dropdown {
         flex: 1 1 calc(50% - 4px);
         min-width: 0;
@@ -5535,7 +5698,7 @@ INDEX_HTML = r"""<!doctype html>
       .active-card button {
         width: 100%;
       }
-      button, .btn-telegram {
+      button, .btn-telegram, .btn-sponsor {
         min-height: 44px;
       }
       .input-field,
@@ -5814,6 +5977,10 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
       Telegram
     </a>
+    <a href="javascript:void(0)" onclick="toggleSponsorBanner()" class="btn-sponsor" title="赞助支持项目开发">
+      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="color: #ff5e5b; margin-right: 4px;"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+      赞助
+    </a>
     <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg>
       更新节点
@@ -5850,7 +6017,36 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </header>
 <main>
-  
+  <!-- 赞助横幅 (Sponsorship Banner) -->
+  <section id="sponsor_banner" class="sponsor-banner" style="display: none;">
+    <div class="sponsor-banner-left">
+      <div class="sponsor-icon-wrapper">
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+      </div>
+      <div class="sponsor-text">
+        <div class="sponsor-title">
+          <span>喜欢并支持 AimiliVPN 项目开发？</span>
+        </div>
+        <div class="sponsor-desc">
+          本项目开源免费，持续为您提供稳定出站代理。欢迎赞助支持开发者，让节点与功能维护更长久！
+        </div>
+      </div>
+    </div>
+    <div class="sponsor-actions">
+      <a href="https://afdian.com/a/playlab" target="_blank" rel="noopener noreferrer" class="sponsor-btn afdian-btn">
+        <svg style="width:14px; height:14px;" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        <span>爱发电赞助</span>
+      </a>
+      <a href="https://ko-fi.com/playlaboratory" target="_blank" rel="noopener noreferrer" class="sponsor-btn kofi-btn">
+        <svg style="width:15px; height:15px;" viewBox="0 0 24 24" fill="currentColor"><path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.868l-.008-.823s2.555.225 4.542-1.39c2.193-1.782 2.115-4.562 2.115-4.562zm-6.233 4.962l-.008.406s-.111 1.488-1.574 1.547c-2.486.099-7.902.049-7.902.049-1.921-.082-1.89-1.637-1.89-1.637l.019-7.234h11.355v6.869zm3.877-2.613s-.657 1.258-2.228 1.402l-.014-2.883s.772.015 1.503-.021c.883-.043 1.353.479.739 1.502zM8.334 11.082s.642-1.464 1.836-1.464c.907 0 1.544.755 1.544 1.639 0 1.282-1.544 2.378-1.544 2.378s-1.543-1.096-1.543-2.378c0-.884.637-1.639 1.544-1.639.712 0 1.139.52 1.343.834z"/></svg>
+        <span>Ko-fi 赞助</span>
+      </a>
+      <button type="button" class="sponsor-close-btn" onclick="dismissSponsorBanner()" title="暂不显示" aria-label="关闭赞助横幅">
+        <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>
+  </section>
+
     <!-- 当前连接活动节点卡片 -->
     <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
       <!-- Rendered dynamically by render() -->
@@ -6236,6 +6432,27 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
+
+  <footer class="app-footer" style="margin-top: 32px; padding: 20px 0; border-top: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--text-secondary);">
+    <div>
+      AimiliVPN &copy; 开源节点管理与代理网关
+    </div>
+    <div style="display: flex; align-items: center; gap: 16px;">
+      <span style="color: var(--text-secondary);">☕ 赞助支持：</span>
+      <a href="https://afdian.com/a/playlab" target="_blank" rel="noopener noreferrer" style="color: #a78bfa; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; font-weight: 500;">
+        <span style="display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #946ce6;"></span> 爱发电
+      </a>
+      <a href="https://ko-fi.com/playlaboratory" target="_blank" rel="noopener noreferrer" style="color: #f87171; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; font-weight: 500;">
+        <span style="display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #ff5e5b;"></span> Ko-fi
+      </a>
+      <a href="https://t.me/playlab_group" target="_blank" rel="noopener noreferrer" style="color: #38bdf8; text-decoration: none;">
+        Telegram
+      </a>
+      <a href="https://github.com/askfname/aimili-vpngate" target="_blank" rel="noopener noreferrer" style="color: var(--text-secondary); text-decoration: none;">
+        GitHub
+      </a>
+    </div>
+  </footer>
 </main>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
@@ -8070,7 +8287,47 @@ async function logoutAdmin() {
   }
 }
 
+function initSponsorBanner() {
+  const banner = $("sponsor_banner");
+  if (!banner) return;
+  const dismissed = localStorage.getItem("aimili_sponsor_dismissed_until");
+  if (dismissed && Date.now() < parseInt(dismissed, 10)) {
+    banner.style.display = "none";
+  } else {
+    banner.style.display = "flex";
+  }
+}
+
+function dismissSponsorBanner() {
+  const banner = $("sponsor_banner");
+  if (!banner) return;
+  banner.style.opacity = "0";
+  banner.style.transform = "translateY(-6px)";
+  setTimeout(() => {
+    banner.style.display = "none";
+  }, 250);
+  localStorage.setItem("aimili_sponsor_dismissed_until", (Date.now() + 14 * 86400 * 1000).toString());
+}
+
+function toggleSponsorBanner() {
+  const banner = $("sponsor_banner");
+  if (!banner) return;
+  if (banner.style.display === "none") {
+    banner.style.display = "flex";
+    banner.style.opacity = "0";
+    banner.style.transform = "translateY(-6px)";
+    setTimeout(() => {
+      banner.style.opacity = "1";
+      banner.style.transform = "translateY(0)";
+    }, 10);
+    localStorage.removeItem("aimili_sponsor_dismissed_until");
+  } else {
+    dismissSponsorBanner();
+  }
+}
+
 // 页面加载时自动初始化数据
+initSponsorBanner();
 load().catch(error => console.error("初始化节点数据失败", error));
 
 // 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
