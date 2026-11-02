@@ -19,6 +19,7 @@ AimiliVPN은 Python 표준 라이브러리로 VPNGate 노드를 관리하며 노
 | --- | --- |
 | Web 관리 화면 | TCP `8787`, 전용 경로, 사용자 이름, 비밀번호 |
 | 로컬 프록시 | `127.0.0.1:7928`, HTTP, HTTPS `CONNECT`, SOCKS5 |
+| OpenCode 검사 | 국가 + IP 유형으로 노드를 필터링하고 각 노드 출구 IP로 공개 무료 모델 검사 |
 | 소스 배포 | x64, x86, ARM64, ARM32 Linux |
 
 > [!IMPORTANT]
@@ -34,6 +35,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/i
 ```
 
 설치 후 Web 관리 화면의 전체 URL, 전용 경로, 사용자 이름과 비밀번호가 표시됩니다. `ml` 명령으로 관리 메뉴를 열 수 있습니다.
+
+무인 설치 시 첫 실행 질문을 명시적으로 건너뛰고 Web 경로와 로그인 정보를 자동 생성합니다.
+
+```bash
+AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/install.sh)
+```
 
 > [!TIP]
 > VPS 제어판에서 TUN/TAP을 활성화하고 `/dev/net/tun`이 존재하는지 확인하십시오. Web 기본 포트는 TCP `8787`이며 가능하면 자신의 IP만 허용하십시오.
@@ -108,7 +115,65 @@ curl -x http://127.0.0.1:7928 https://api.ipify.org
 curl --proxy socks5h://127.0.0.1:7928 https://api.ipify.org
 ```
 
-### 4. 다른 컴퓨터에서 연결
+<details>
+<summary><strong>Shell 환경 변수 및 Python 예시</strong></summary>
+
+```bash
+export http_proxy="http://127.0.0.1:7928"
+export https_proxy="http://127.0.0.1:7928"
+curl https://api.ipify.org
+```
+
+```python
+import requests
+
+proxies = {
+  "http": "http://127.0.0.1:7928",
+  "https": "http://127.0.0.1:7928",
+}
+
+response = requests.get("https://api.ipify.org", proxies=proxies, timeout=20)
+print(response.text)
+```
+
+</details>
+
+### 4. OpenCode 노드 검사
+
+Web 도구 모음의 “OpenCode 검사”는 현재 “국가 + IP 유형” 필터 결과에 포함된 모든 노드에 임시 테스트 터널을 동시에 만들고 각 노드 출구 IP를 통해 OpenCode 공개 무료 모델을 요청합니다. 검사는 국가와 IP 유형 필터만 적용하며 가용 상태와 즐겨찾기 필터는 무시해 선택 범위의 모든 노드를 검사합니다.
+
+- **사용 가능:** 노드 출구에서 비어 있지 않은 모델 응답을 받아 OpenCode 무료 할당량을 사용할 수 있습니다.
+- **할당량 소진:** `402`, `429` 또는 Free usage limit 등의 할당량 제한 응답입니다.
+- **사용 불가:** 터널 생성, TLS/연결 또는 인증에 실패했거나 응답이 비어 있습니다.
+- **검사 안 함:** 아직 검사를 실행하지 않았습니다.
+- 검사는 언제든 중지할 수 있습니다. 결과와 진행률은 실시간으로 업데이트되며 “사용 가능한 항목만 보기”로 성공한 노드를 필터링할 수 있습니다.
+- 검사 중 여러 `tun` 인터페이스와 정책 경로를 임시 사용합니다. 검사가 끝나거나 중지될 때까지 노드 전환과 수동 테스트가 비활성화됩니다.
+
+> Linux TUN/TAP, OpenVPN, `iproute2`, `root`/`NET_ADMIN` 권한 및 **Bun 런타임**이 필요합니다. Windows/macOS 클라이언트에서는 실행할 수 없습니다. 설치 스크립트가 Bun을 자동 설치하며, `OPENCODE_BUN_PATH`로 `bun` 실행 파일을 지정할 수 있습니다. 공개 채널 할당량은 노드 출구 IP를 기준으로 하며 제3자 노드의 장기적인 안정성을 보장하지 않습니다.
+
+<details>
+<summary><strong>OpenCode 검사 환경 변수</strong></summary>
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `OPENCODE_API_BASE` | `https://opencode.ai/inference/v1` | 공개 API 루트(모델 목록) |
+| `OPENCODE_API_URL` | `https://opencode.ai/inference/openai/v1/chat/completions` | 검사에 사용하는 완료 요청 엔드포인트 |
+| `OPENCODE_MODELS_URL` | `${OPENCODE_API_BASE}/models` | 무료 모델 목록 엔드포인트 |
+| `OPENCODE_API_KEY` | `public` | 공개 채널 Bearer 값 |
+| `OPENCODE_MODEL` | 비어 있음(무료 모델 자동 선택) | 검사 모델 지정(페이지 드롭다운보다 우선) |
+| `OPENCODE_FALLBACK_MODEL` | `beam-free` | 모델 목록을 사용할 수 없을 때 대체 모델 |
+| `OPENCODE_CHECK_WORKERS` | `10` | 동시 테스트 터널 수, 범위 1–24 |
+| `OPENCODE_CHECK_TIMEOUT_SECONDS` | `20` | 노드별 API 요청 시간 제한 |
+| `OPENCODE_OPENVPN_TIMEOUT_SECONDS` | `12` | 노드별 터널 생성 시간 제한 |
+| `OPENCODE_CHECK_NODE_LIMIT` | `2000` | 한 번의 검사에서 처리할 최대 노드 수 |
+| `OPENCODE_BUN_PATH` | 비어 있음(PATH 및 일반적인 설치 경로 자동 탐색) | Bun 실행 파일 경로 |
+| `OPENCODE_EXTRA_HEADERS` | 비어 있음 | 추가 요청 헤더(JSON 객체 문자열, 모델 목록에만 적용) |
+
+환경 변수 변경을 적용하려면 서비스 또는 컨테이너를 재시작하십시오.
+
+</details>
+
+### 5. 다른 컴퓨터에서 연결
 
 프록시를 공개하지 말고 SSH 터널을 사용하십시오.
 

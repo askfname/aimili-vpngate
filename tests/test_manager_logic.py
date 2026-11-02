@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -103,6 +105,38 @@ class FakeSocket:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeProbeProcess:
+    """模拟 Bun 探针子进程：控制输出、第几次 wait 后结束与 kill 标记。"""
+
+    def __init__(self, output: str, finish_after: int | None = 0) -> None:
+        self.output = output
+        self.finish_after = finish_after
+        self.wait_calls = 0
+        self.finished = False
+        self.killed = False
+        self.cmdline: list[str] = []
+
+    def poll(self):
+        return 0 if (self.finished or self.killed) else None
+
+    def terminate(self):
+        self.killed = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        if self.killed or (self.finish_after is not None and self.wait_calls > self.finish_after):
+            self.finished = True
+            return 0
+        raise subprocess.TimeoutExpired(self.cmdline or ["bun"], timeout)
+
+    def communicate(self, timeout=5):
+        self.finished = True
+        return self.output, ""
 
 
 class ManagerLogicTests(unittest.TestCase):
@@ -793,7 +827,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("official_https", state["last_fetch_source"])
         self.assertIn("保留 0 个", state["last_fetch_message"])
 
-    def test_opencode_models_prefer_known_free_model(self) -> None:
+    def test_opencode_models_preserve_listing_order(self) -> None:
         payload = {
             "data": [
                 {"id": "paid-model", "cost": {"text": {"input": {"price": 10}, "output": {"price": 50}}}},
@@ -805,89 +839,164 @@ class ManagerLogicTests(unittest.TestCase):
 
         models = manager.parse_opencode_models(json.dumps(payload))
 
-        self.assertEqual(["big-pickle", "beam-free", "opaque-free"], models)
+        self.assertEqual(["beam-free", "big-pickle", "opaque-free"], models)
         self.assertNotIn("paid-model", models)
 
     def test_opencode_failure_kind_distinguishes_quota_from_errors(self) -> None:
         self.assertEqual("limited", manager.opencode_failure_kind(429, "too many requests"))
         self.assertEqual("limited", manager.opencode_failure_kind(402, "insufficient funds"))
-        self.assertEqual("limited", manager.opencode_failure_kind(403, "Free usage limit reached"))
+        # 403 属于形状/权限问题，不再误标为额度用尽
+        self.assertEqual("failed", manager.opencode_failure_kind(403, "Free usage limit reached"))
         self.assertEqual("limited", manager.opencode_failure_kind(200, "FreeTierError"))
         self.assertEqual("failed", manager.opencode_failure_kind(401, "Unauthorized"))
         self.assertEqual("failed", manager.opencode_failure_kind(500, "internal error"))
 
-    def probe_opencode(self, response: bytes) -> tuple[tuple[str, str, int], FakeSocket]:
-        target = {
-            "host": "opencode.ai",
-            "port": 80,
-            "path": "/zen/v1/chat/completions",
-            "ips": ["203.0.113.10"],
-            "https": False,
-            "host_header": "opencode.ai",
-        }
-        fake_socket = FakeSocket(response)
-        with (
-            mock.patch.object(manager.socket, "SO_MARK", 1, create=True),
-            mock.patch.object(manager.socket, "socket", return_value=fake_socket),
-            mock.patch.object(manager, "OPENCODE_API_KEY", "public"),
-        ):
-            result = manager.opencode_http_probe(
-                target,
-                "big-pickle",
-                0x4F430002,
-                threading.Event(),
-            )
-        return result, fake_socket
-
-    def test_opencode_probe_requires_real_stream_content(self) -> None:
-        body = (
-            b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
-            b'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n'
+    def test_opencode_probe_output_parsing_and_classification(self) -> None:
+        result = manager.opencode_parse_probe_output(
+            'PROBE: {"status": 429, "content": "", "message": "Free usage limit reached.", "latency": 55}'
         )
-        response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" + body
-        (status, message, latency), fake_socket = self.probe_opencode(response)
+        self.assertTrue(result.get("structured"))
+        status, message = manager.opencode_probe_result_status(result)
+        self.assertEqual("limited", status)
+        self.assertIn("Free usage limit", message)
+
+        available = manager.opencode_probe_result_status(
+            {"status": 200, "content": "OK", "message": "", "latency": 88}
+        )
+        self.assertEqual(("available", "正常回复: OK"), available)
+
+        fallback = manager.opencode_parse_probe_output("bun: 1 | ERROR boom")
+        self.assertFalse(fallback.get("structured"))
+        self.assertEqual("bun: 1 | ERROR boom", fallback.get("message"))
+
+    def test_bun_probe_script_matches_client_shape(self) -> None:
+        script = manager.BUN_PROBE_SCRIPT
+        for marker in (
+            "authorization",
+            "traceparent",
+            "x-opencode-client",
+            "x-opencode-project",
+            "x-opencode-session-id",
+            "x-session-affinity",
+            "stream_options",
+            'TOOL_PARAMETER = { edit: "path", glob: "pattern", grep: "pattern", read: "path", shell: "command" }',
+            "Working directory: ${cwd}",
+            "Platform: ${process.platform}",
+        ):
+            self.assertIn(marker, script)
+
+    def test_bun_probe_script_syntax_is_valid(self) -> None:
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed; Bun probe script check skipped")
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as handle:
+            handle.write(manager.BUN_PROBE_SCRIPT)
+            script_path = Path(handle.name)
+        try:
+            result = subprocess.run(
+                ["node", "--check", str(script_path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+        finally:
+            Path(script_path).unlink(missing_ok=True)
+
+    def test_opencode_probe_requests_via_bun_and_local_proxy(self) -> None:
+        output = 'PROBE: {"status": 200, "content": "OK", "message": "", "latency": 123}\n'
+        process = FakeProbeProcess(output)
+        with self.patched_bun_probe(process) as captured:
+            status, message, latency = manager.opencode_probe_fetch(
+                self.opencode_probe_target(), "beam-free", 0x4F430002, threading.Event()
+            )
 
         self.assertEqual("available", status)
         self.assertIn("OK", message)
-        self.assertGreater(latency, 0)
-        self.assertEqual(("203.0.113.10", 80), fake_socket.address)
-        self.assertEqual(0x4F430002, fake_socket.options[0][2])
-        self.assertIn(b"Authorization: Bearer public", fake_socket.sent)
-        self.assertIn(b'"model": "big-pickle"', fake_socket.sent)
-        self.assertTrue(fake_socket.closed)
+        self.assertEqual(123, latency)
+        proxy_cls = captured["proxy_cls"]
+        proxy_args = proxy_cls.call_args[0]
+        self.assertEqual("opencode.ai", proxy_args[0]["host"])
+        self.assertEqual(0x4F430002, proxy_args[1])
+        cmdline = captured["cmdline"]
+        self.assertEqual("/usr/bin/bun", cmdline[0])
+        self.assertEqual("beam-free", cmdline[-1])
+        kwargs = captured["kwargs"]
+        self.assertEqual("http://127.0.0.1:47521", kwargs["env"]["HTTPS_PROXY"])
+        self.assertNotIn("NO_PROXY", kwargs["env"])
+        self.assertEqual(str(manager.DATA_DIR), kwargs["cwd"])
+        self.assertTrue(captured["proxy"].close.called)
 
-    def test_opencode_probe_classifies_quota_and_empty_responses(self) -> None:
-        quota_body = json.dumps(
-            {
-                "type": "error",
-                "error": {
-                    "type": "FreeUsageLimitError",
-                    "message": "Free usage limit reached.",
-                },
-            }
-        ).encode("utf-8")
-        quota_response = (
-            b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\r\n" + quota_body
-        )
-        empty_response = (
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
-            b'{"choices":[{"message":{"content":"   "}}]}'
-        )
+    def test_opencode_probe_reports_timeout_when_bun_hangs(self) -> None:
+        process = FakeProbeProcess("", finish_after=None)
+        with mock.patch.object(manager, "OPENCODE_CHECK_TIMEOUT_SECONDS", 1):
+            with self.patched_bun_probe(process) as captured:
+                status, message, _ = manager.opencode_probe_fetch(
+                    self.opencode_probe_target(), "beam-free", 0, threading.Event()
+                )
 
-        self.assertEqual("limited", self.probe_opencode(quota_response)[0][0])
-        self.assertEqual("failed", self.probe_opencode(empty_response)[0][0])
+        self.assertEqual("failed", status)
+        self.assertIn("超时", message)
+        self.assertTrue(process.killed)
 
-    def test_opencode_content_accepts_reasoning_chunks(self) -> None:
-        payload = {"choices": [{"delta": {"reasoning_content": "checking quota"}}]}
-        self.assertEqual("checking quota", manager.opencode_content_text(payload))
-        payload = {"choices": [{"delta": {"content": [{"type": "text", "text": "OK"}]}}]}
-        self.assertEqual("OK", manager.opencode_content_text(payload))
-        self.assertEqual(
-            "Free usage limit reached",
-            manager.opencode_error_text(
-                {"type": "FreeUsageLimitError", "message": "Free usage limit reached"}
-            ),
-        )
+    def test_opencode_probe_honors_cancel_before_start(self) -> None:
+        cancel = threading.Event()
+        cancel.set()
+        process = FakeProbeProcess("", finish_after=None)
+        with self.patched_bun_probe(process) as captured:
+            status, message, _ = manager.opencode_probe_fetch(
+                self.opencode_probe_target(), "beam-free", 0, cancel
+            )
+
+        self.assertEqual("failed", status)
+        self.assertEqual("检测已取消", message)
+        self.assertFalse(captured["proxy_cls"].called)
+        self.assertFalse(captured["popen"].called)
+
+    def test_opencode_probe_surfaces_proxy_failure(self) -> None:
+        process = FakeProbeProcess("bun: 1 | ERROR boom")
+        with self.patched_bun_probe(process) as captured:
+            status, message, _ = manager.opencode_probe_fetch(
+                self.opencode_probe_target(), "beam-free", 0, threading.Event()
+            )
+
+        self.assertEqual("failed", status)
+        self.assertIn("连接 OpenCode API 失败", message)
+        self.assertFalse(process.killed)
+
+    def opencode_probe_target(self) -> dict:
+        return {
+            "host": "opencode.ai",
+            "port": 443,
+            "path": "/inference/openai/v1/chat/completions",
+            "ips": ["203.0.113.10"],
+            "https": True,
+            "host_header": "opencode.ai",
+        }
+
+    @contextmanager
+    def patched_bun_probe(self, process: FakeProbeProcess):
+        """打桩 Bun 探针的外部依赖：bun 路径、本地代理与子进程。"""
+        captured: dict = {}
+
+        def fake_popen(cmdline, **kwargs):
+            captured["cmdline"] = cmdline
+            captured["kwargs"] = kwargs
+            process.cmdline = cmdline
+            return process
+
+        proxy_stub = mock.Mock()
+        proxy_stub.port = 47521
+        proxy_stub.last_error = "连接 OpenCode API 失败 (203.0.113.10): connection refused"
+        with (
+            mock.patch.object(manager, "find_bun_executable", return_value="/usr/bin/bun"),
+            mock.patch.object(manager, "OpencodeLocalProxy", return_value=proxy_stub) as proxy_cls,
+            mock.patch.object(manager.subprocess, "Popen", side_effect=fake_popen) as popen_mock,
+        ):
+            captured["proxy_cls"] = proxy_cls
+            captured["popen"] = popen_mock
+            captured["proxy"] = proxy_stub
+            yield captured
 
     def test_failed_opencode_start_keeps_external_maintenance_lock(self) -> None:
         self.assertTrue(manager.maintenance_lock.acquire(blocking=False))
@@ -948,10 +1057,13 @@ class ManagerLogicTests(unittest.TestCase):
             'id="opencode_panel"',
             'id="opencode_only_available"',
             'id="opencode_progress_bar"',
-            "function getOpencodeCandidateNodes",
+            'id="opencode_model_select"',
+            "function getFilteredNodes",
             "function startOpencodeCheck",
             "function stopOpencodeCheck",
             "./api/opencode_check",
+            "./api/opencode_models",
+            "ensureOpencodeModelsLoaded",
             "opencodeBadgeHtml(n)",
         ):
             self.assertIn(marker, manager.INDEX_HTML)

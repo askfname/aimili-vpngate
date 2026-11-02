@@ -150,24 +150,25 @@ Web 工具栏的“检测 OpenCode”会对当前“国家 + IP 类型”筛选�
 - 检测可随时停止；结果列与进度面板实时更新，“只看可用”可快速筛出成功节点。
 - 检测会临时占用多个 `tun` 接口和策略路由，期间节点切换与手动测试暂时禁用，请等待检测结束或先停止检测。
 
-> 检测依赖 Linux TUN/TAP、OpenVPN、`iproute2` 以及 `root`/`NET_ADMIN` 权限；Windows/macOS 客户端无法执行。公开通道额度按节点出口 IP 计算，不代表第三方节点本身长期稳定。
+> 检测依赖 Linux TUN/TAP、OpenVPN、`iproute2` 以及 `root`/`NET_ADMIN` 权限，并需要 **Bun 运行时**；Windows/macOS 客户端无法执行。安装脚本会自动安装 Bun，也可用 `OPENCODE_BUN_PATH` 指定 `bun` 可执行文件。公开通道额度按节点出口 IP 计算，不代表第三方节点本身长期稳定。
 
 <details>
 <summary><strong>OpenCode 检测环境变量</strong></summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `OPENCODE_API_BASE` | `https://opencode.ai/zen/v1` | Zen 公开 API 根地址 |
-| `OPENCODE_API_URL` | `${OPENCODE_API_BASE}/chat/completions` | 检测用补全接口 |
+| `OPENCODE_API_BASE` | `https://opencode.ai/inference/v1` | 公开 API 根地址（模型列表） |
+| `OPENCODE_API_URL` | `https://opencode.ai/inference/openai/v1/chat/completions` | 检测用补全接口 |
 | `OPENCODE_MODELS_URL` | `${OPENCODE_API_BASE}/models` | 免费模型列表接口 |
 | `OPENCODE_API_KEY` | `public` | 公开通道 Bearer 值 |
-| `OPENCODE_MODEL` | 空（自动选择免费模型） | 指定检测模型 |
-| `OPENCODE_FALLBACK_MODEL` | `big-pickle` | 模型列表不可用时的备用模型 |
+| `OPENCODE_MODEL` | 空（自动选择免费模型） | 指定检测模型（优先于页面下拉选择） |
+| `OPENCODE_FALLBACK_MODEL` | `beam-free` | 模型列表不可用时的备用模型 |
 | `OPENCODE_CHECK_WORKERS` | `10` | 并发测试隧道数，范围 1–24 |
 | `OPENCODE_CHECK_TIMEOUT_SECONDS` | `20` | 单节点 API 请求超时 |
 | `OPENCODE_OPENVPN_TIMEOUT_SECONDS` | `12` | 单节点建隧超时 |
 | `OPENCODE_CHECK_NODE_LIMIT` | `2000` | 单次检测节点上限 |
-| `OPENCODE_EXTRA_HEADERS` | 空 | 额外请求头，JSON 对象字符串 |
+| `OPENCODE_BUN_PATH` | 空（自动探测 PATH 与常见安装路径） | Bun 可执行文件路径 |
+| `OPENCODE_EXTRA_HEADERS` | 空 | 额外请求头，JSON 对象字符串（仅作用于模型列表） |
 
 修改环境变量后重启服务或容器生效。
 

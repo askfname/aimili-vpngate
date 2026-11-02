@@ -12,13 +12,19 @@ LABEL org.opencontainers.image.title="AimiliVPN" \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         iproute2 \
         iptables \
         openvpn \
         procps \
         psmisc \
         python3 \
+        unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# 安装 Bun 运行时：OpenCode 免费额度检测必须经由 Bun 的 HTTP 栈发请求
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash \
+    && bun --version
 
 WORKDIR /app
 COPY VERSION README.md LICENSE ./

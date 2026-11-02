@@ -19,6 +19,7 @@ AimiliVPN は Python 標準ライブラリで VPNGate ノードを管理し、�
 | --- | --- |
 | Web 管理画面 | TCP `8787`、専用パス、ユーザー名、パスワード |
 | ローカルプロキシ | `127.0.0.1:7928`、HTTP、HTTPS `CONNECT`、SOCKS5 |
+| OpenCode 検査 | 国 + IP 種別でノードを絞り込み、各ノードの出口から公開無料モデルを検査 |
 | ソース版 | x64、x86、ARM64、ARM32 Linux |
 
 > [!IMPORTANT]
@@ -34,6 +35,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/i
 ```
 
 完了後、Web 管理画面の URL、専用パス、ユーザー名、パスワードが表示されます。`ml` で管理メニューを開けます。
+
+無人インストールでは、初回の質問を明示的にスキップし、Web パスと認証情報を自動生成します。
+
+```bash
+AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/install.sh)
+```
 
 > [!TIP]
 > VPS の管理画面で TUN/TAP を有効にし、`/dev/net/tun` が存在することを確認してください。Web のデフォルトポートは TCP `8787` です。可能な限り自分の IP だけを許可してください。
@@ -108,7 +115,65 @@ curl -x http://127.0.0.1:7928 https://api.ipify.org
 curl --proxy socks5h://127.0.0.1:7928 https://api.ipify.org
 ```
 
-### 4. 別の端末から接続
+<details>
+<summary><strong>Shell 環境変数と Python の例</strong></summary>
+
+```bash
+export http_proxy="http://127.0.0.1:7928"
+export https_proxy="http://127.0.0.1:7928"
+curl https://api.ipify.org
+```
+
+```python
+import requests
+
+proxies = {
+  "http": "http://127.0.0.1:7928",
+  "https": "http://127.0.0.1:7928",
+}
+
+response = requests.get("https://api.ipify.org", proxies=proxies, timeout=20)
+print(response.text)
+```
+
+</details>
+
+### 4. OpenCode ノードを検査
+
+Web ツールバーの「OpenCode 検査」は、現在の「国 + IP 種別」フィルターに一致するすべてのノードに一時テストトンネルを並行して作成し、各ノードの出口から OpenCode の公開無料モデルへリクエストします。検査では国と IP 種別のみを使用し、可用性とお気に入りのフィルターは無視して、選択範囲の全ノードを対象にします。
+
+- **利用可能：** ノード出口から空でないモデル応答が返り、OpenCode の無料枠を利用できます。
+- **枠を使い切り：** `402`、`429`、Free usage limit などの利用制限が返されました。
+- **利用不可：** トンネル確立、TLS/接続、認証に失敗したか、応答が空です。
+- **未検査：** まだ検査を実行していません。
+- 検査はいつでも停止できます。結果と進捗はリアルタイムで更新され、「利用可能のみ表示」で成功ノードを絞り込めます。
+- 実行中は複数の `tun` インターフェースとポリシールートを一時使用します。検査の終了または停止まで、ノード切り替えと手動テストは無効になります。
+
+> Linux TUN/TAP、OpenVPN、`iproute2`、`root`/`NET_ADMIN` 権限、および **Bun ランタイム**が必要です。Windows/macOS クライアントでは実行できません。インストールスクリプトが Bun を自動でインストールします。別の実行ファイルを指定する場合は `OPENCODE_BUN_PATH` を設定してください。公開チャンネルの利用枠はノード出口 IP ごとに計算され、第三者ノードの長期的な安定性を保証するものではありません。
+
+<details>
+<summary><strong>OpenCode 検査の環境変数</strong></summary>
+
+| 変数 | デフォルト | 説明 |
+| --- | --- | --- |
+| `OPENCODE_API_BASE` | `https://opencode.ai/inference/v1` | 公開 API ルート（モデル一覧） |
+| `OPENCODE_API_URL` | `https://opencode.ai/inference/openai/v1/chat/completions` | 検査に使用する補完エンドポイント |
+| `OPENCODE_MODELS_URL` | `${OPENCODE_API_BASE}/models` | 無料モデル一覧エンドポイント |
+| `OPENCODE_API_KEY` | `public` | 公開チャンネルの Bearer 値 |
+| `OPENCODE_MODEL` | 空（無料モデルを自動選択） | 検査モデル。画面の選択より優先 |
+| `OPENCODE_FALLBACK_MODEL` | `beam-free` | モデル一覧を取得できない場合の代替モデル |
+| `OPENCODE_CHECK_WORKERS` | `10` | 同時テストトンネル数、範囲 1–24 |
+| `OPENCODE_CHECK_TIMEOUT_SECONDS` | `20` | ノードごとの API リクエストタイムアウト |
+| `OPENCODE_OPENVPN_TIMEOUT_SECONDS` | `12` | ノードごとのトンネル確立タイムアウト |
+| `OPENCODE_CHECK_NODE_LIMIT` | `2000` | 1 回の検査で処理するノード上限 |
+| `OPENCODE_BUN_PATH` | 空（PATH と一般的なインストール先を自動検出） | Bun 実行ファイルのパス |
+| `OPENCODE_EXTRA_HEADERS` | 空 | 追加ヘッダー（モデル一覧にのみ適用する JSON オブジェクト文字列） |
+
+環境変数の変更を反映するには、サービスまたはコンテナを再起動してください。
+
+</details>
+
+### 5. 別の端末から接続
 
 プロキシを公開せず、SSH トンネルを利用してください。
 

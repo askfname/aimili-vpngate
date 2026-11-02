@@ -126,15 +126,15 @@ SWITCH_PREFLIGHT_MAX_AGE_SECONDS = env_int("SWITCH_PREFLIGHT_MAX_AGE_SECONDS", 1
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
-OPENCODE_API_BASE = os.environ.get("OPENCODE_API_BASE", "https://opencode.ai/zen/v1").rstrip("/")
-OPENCODE_API_URL = os.environ.get("OPENCODE_API_URL", f"{OPENCODE_API_BASE}/chat/completions").strip()
+OPENCODE_API_BASE = os.environ.get("OPENCODE_API_BASE", "https://opencode.ai/inference/v1").rstrip("/")
+OPENCODE_API_URL = os.environ.get("OPENCODE_API_URL", "https://opencode.ai/inference/openai/v1/chat/completions").strip()
 OPENCODE_MODELS_URL = os.environ.get("OPENCODE_MODELS_URL", f"{OPENCODE_API_BASE}/models").strip()
 OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", os.environ.get("OPENCODE_ZEN_API_KEY", "public")).strip()
 OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "").strip()
-OPENCODE_FALLBACK_MODEL = os.environ.get("OPENCODE_FALLBACK_MODEL", "big-pickle").strip() or "big-pickle"
+OPENCODE_FALLBACK_MODEL = os.environ.get("OPENCODE_FALLBACK_MODEL", "beam-free").strip() or "beam-free"
 OPENCODE_EXTRA_HEADERS = os.environ.get("OPENCODE_EXTRA_HEADERS", "").strip()
 OPENCODE_CHECK_PROMPT = os.environ.get("OPENCODE_CHECK_PROMPT", "Reply with the single word OK.").strip() or "Reply with the single word OK."
-OPENCODE_CHECK_MAX_TOKENS = env_int("OPENCODE_CHECK_MAX_TOKENS", 32, 1, 64)
+OPENCODE_CLIENT_VERSION_TTL_SECONDS = 6 * 3600
 OPENCODE_CHECK_WORKERS = env_int("OPENCODE_CHECK_WORKERS", 10, 1, 24)
 OPENCODE_CHECK_TIMEOUT_SECONDS = env_int("OPENCODE_CHECK_TIMEOUT_SECONDS", 20, 5, 90)
 OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS = env_int("OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS", 8, 2, 30)
@@ -224,7 +224,72 @@ opencode_check_stats: dict[str, Any] = {
     "finished_at": 0.0,
     "cancelled": False,
 }
-_opencode_ssl_context: ssl.SSLContext | None = None
+_opencode_client_version: str = ""
+_opencode_client_version_at: float = 0.0
+_opencode_probe_script_lock = threading.Lock()
+
+def opencode_client_version() -> str:
+    """获取 OpenCode CLI 最新版本号伪装真实客户端，每 6 小时刷新，失败回退 2.2.5。"""
+    global _opencode_client_version, _opencode_client_version_at
+    now = time.time()
+    if _opencode_client_version and now - _opencode_client_version_at < OPENCODE_CLIENT_VERSION_TTL_SECONDS:
+        return _opencode_client_version
+    fallback = "2.2.5"
+    try:
+        url = f"https://opencode.ai/update/api/latest/cli/npm?current={fallback}"
+        request = urllib.request.Request(url, headers={"User-Agent": f"opencode/latest/{fallback}/cli"})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            data = json.loads(response.read(4096).decode("utf-8", errors="replace"))
+        version = str(data.get("version") or "").strip() if isinstance(data, dict) else ""
+        _opencode_client_version = version if version else fallback
+        _opencode_client_version_at = now
+        return _opencode_client_version
+    except Exception:
+        _opencode_client_version_at = now
+        return _opencode_client_version or fallback
+
+def opencode_session_id() -> str:
+    suffix = re.sub(r"[^A-Za-z0-9]", "", secrets.token_urlsafe(24))[:14].ljust(14, "x")
+    return f"ses_{secrets.token_hex(6)}{suffix}"
+
+def opencode_extra_headers() -> dict[str, str]:
+    if not OPENCODE_EXTRA_HEADERS:
+        return {}
+    try:
+        raw = json.loads(OPENCODE_EXTRA_HEADERS)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    headers: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key or "").strip()
+        text = str(value if value is not None else "").strip()
+        if name and not re.search(r"[\r\n]", name + text):
+            headers[name] = text
+    return headers
+
+def build_opencode_headers(host: str, accept: str) -> dict[str, str]:
+    session_id = opencode_session_id()
+    api_key = re.sub(r"[\r\n]+", "", OPENCODE_API_KEY)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": accept,
+        "Accept-Encoding": "identity",
+        "Cache-Control": "no-cache",
+        "User-Agent": f"opencode/latest/{opencode_client_version()}/cli",
+        "x-opencode-client": "cli",
+        "x-session-id": session_id,
+        "x-opencode-session": session_id,
+        "x-opencode-session-id": session_id,
+        "x-session-affinity": session_id,
+        "x-opencode-request": uuid.uuid4().hex,
+    }
+    if not api_key:
+        headers.pop("Authorization", None)
+    headers.update(opencode_extra_headers())
+    return headers
 
 IP_ENRICHMENT_FIELDS = (
     "owner",
@@ -368,6 +433,7 @@ def load_ui_config() -> dict[str, Any]:
             "favorite_node_ids": [],
             "fav_fail_fallback": False,
             "discovery_countries": [],
+            "opencode_model": "",
         }
         updated = False
         if auth_file.exists():
@@ -379,7 +445,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries", "opencode_model"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -571,6 +637,7 @@ def get_state() -> dict[str, Any]:
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["discovery_countries"] = normalize_discovery_countries(ui_cfg.get("discovery_countries"))
     state["fav_fail_fallback"] = False
+    state["opencode_model"] = str(ui_cfg.get("opencode_model") or "")
     
     return state
 
@@ -2154,55 +2221,6 @@ def reset_stale_opencode_checks() -> None:
         if changed:
             write_json(NODES_FILE, sort_all_nodes(nodes))
 
-def opencode_ssl_context() -> ssl.SSLContext:
-    global _opencode_ssl_context
-    if _opencode_ssl_context is None:
-        _opencode_ssl_context = ssl.create_default_context()
-    return _opencode_ssl_context
-
-def opencode_session_id() -> str:
-    suffix = re.sub(r"[^A-Za-z0-9]", "", secrets.token_urlsafe(24))[:14].ljust(14, "x")
-    return f"ses_{secrets.token_hex(6)}{suffix}"
-
-def opencode_extra_headers() -> dict[str, str]:
-    if not OPENCODE_EXTRA_HEADERS:
-        return {}
-    try:
-        raw = json.loads(OPENCODE_EXTRA_HEADERS)
-    except (TypeError, ValueError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    headers: dict[str, str] = {}
-    for key, value in raw.items():
-        name = str(key or "").strip()
-        text = str(value if value is not None else "").strip()
-        if name and not re.search(r"[\r\n]", name + text):
-            headers[name] = text
-    return headers
-
-def build_opencode_headers(host: str, accept: str) -> dict[str, str]:
-    session_id = opencode_session_id()
-    api_key = re.sub(r"[\r\n]+", "", OPENCODE_API_KEY)
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": accept,
-        "Accept-Encoding": "identity",
-        "Cache-Control": "no-cache",
-        "User-Agent": "opencode/latest/2.0.32/cli",
-        "x-opencode-client": "cli",
-        "x-session-id": session_id,
-        "x-opencode-session": session_id,
-        "x-opencode-session-id": session_id,
-        "x-session-affinity": session_id,
-        "x-opencode-request": uuid.uuid4().hex,
-    }
-    if not api_key:
-        headers.pop("Authorization", None)
-    headers.update(opencode_extra_headers())
-    return headers
-
 def opencode_model_is_free(item: dict[str, Any]) -> bool:
     cost = item.get("cost")
     if not isinstance(cost, dict):
@@ -2247,26 +2265,29 @@ def parse_opencode_models(text: str) -> list[str]:
         all_ids.append(model_id)
         if is_free:
             free_ids.append(model_id)
-    if "big-pickle" in free_ids:
-        free_ids.remove("big-pickle")
-        free_ids.insert(0, "big-pickle")
     return free_ids or all_ids
 
-def resolve_opencode_model() -> str:
+def fetch_opencode_models() -> list[str]:
+    """直连获取 OpenCode 免费模型列表（模型列表接口可用普通 HTTP 栈，无需节点隧道）。"""
+    headers = build_opencode_headers(urllib.parse.urlsplit(OPENCODE_MODELS_URL).hostname or "", "application/json")
+    request = urllib.request.Request(OPENCODE_MODELS_URL, headers=headers, method="GET")
+    with urllib.request.urlopen(request, timeout=OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS) as response:
+        raw = response.read(2 * 1024 * 1024)
+    return parse_opencode_models(raw.decode("utf-8", errors="replace"))
+
+def resolve_opencode_model(requested: str = "") -> str:
+    """确定检测用的免费模型：环境变量 > UI 选择 > 模型列表第一个 > 兜底值。"""
     if OPENCODE_MODEL:
         return OPENCODE_MODEL
-    if not OPENCODE_MODELS_URL:
-        return OPENCODE_FALLBACK_MODEL
-    headers = build_opencode_headers(urllib.parse.urlsplit(OPENCODE_MODELS_URL).hostname or "", "application/json")
+    if requested:
+        return requested
     try:
-        request = urllib.request.Request(OPENCODE_MODELS_URL, headers=headers, method="GET")
-        with urllib.request.urlopen(request, timeout=OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS) as response:
-            raw = response.read(2 * 1024 * 1024)
-        models = parse_opencode_models(raw.decode("utf-8", errors="replace"))
-        if models:
-            return models[0]
+        models = fetch_opencode_models()
     except Exception as exc:
         print(f"[OpenCode] 获取免费模型列表失败，使用备用模型 {OPENCODE_FALLBACK_MODEL}: {exc}", flush=True)
+        return OPENCODE_FALLBACK_MODEL
+    if models:
+        return models[0]
     return OPENCODE_FALLBACK_MODEL
 
 def resolve_opencode_target() -> dict[str, Any]:
@@ -2301,263 +2322,576 @@ def opencode_short_text(value: Any, limit: int = 160) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     return text[:limit]
 
-def opencode_error_text(payload: Any) -> str:
-    if not isinstance(payload, dict):
-        return ""
-    error = payload.get("error")
-    if isinstance(error, dict):
-        return opencode_short_text(
-            error.get("message") or error.get("detail") or error.get("type") or json.dumps(error, ensure_ascii=False)
-        )
-    if isinstance(error, str):
-        return opencode_short_text(error)
-    event_type = str(payload.get("type") or "")
-    if event_type and ("error" in event_type.lower() or event_type.lower() == "ratelimit"):
-        return opencode_short_text(payload.get("message") or event_type)
-    return ""
-
-def opencode_text_value(value: Any) -> str:
-    if isinstance(value, str):
-        return value if value.strip() else ""
-    if isinstance(value, list):
-        texts = [
-            str(item.get("text") or "")
-            for item in value
-            if isinstance(item, dict) and item.get("text")
-        ]
-        return "".join(texts) if any(text.strip() for text in texts) else ""
-    return ""
-
-def opencode_content_text(payload: Any) -> str:
-    if not isinstance(payload, dict):
-        return ""
-    choices = payload.get("choices")
-    if isinstance(choices, list) and choices:
-        choice = choices[0] if isinstance(choices[0], dict) else {}
-        for key in ("delta", "message"):
-            part = choice.get(key)
-            if not isinstance(part, dict):
-                continue
-            content = opencode_text_value(part.get("content"))
-            if content:
-                return content
-            reasoning = opencode_text_value(part.get("reasoning_content")) or opencode_text_value(part.get("reasoning"))
-            if reasoning:
-                return reasoning
-    output_text = opencode_text_value(payload.get("output_text"))
-    if output_text:
-        return output_text
-    return ""
-
 def opencode_failure_kind(status_code: int, message: str) -> str:
-    if status_code in (402, 429) or OPENCODE_LIMIT_PATTERN.search(message or ""):
+    # 探针已用真实客户端形状，429/402 才是额度类失败；401/403 属于形状或权限问题，不再误标额度
+    if status_code in (402, 429):
         return "limited"
     if status_code in (401, 403):
         return "failed"
+    if OPENCODE_LIMIT_PATTERN.search(message or ""):
+        return "limited"
     return "failed"
 
-def opencode_read_bytes(sock: socket.socket, initial: bytes, limit: int, deadline: float) -> bytes:
-    data = bytearray(initial)
-    while len(data) < limit and time.time() < deadline:
+# ===== Bun 探针基础设施 =====
+# 网关按 HTTP/TLS 栈指纹判定请求形状，纯 Python 原始 socket 检测会被误判为
+# "额度用尽"（429 FreeUsageLimitError），因此统一经由 Bun 运行时发请求。
+
+BUN_PROBE_SCRIPT = r"""// OpenCode 免费额度探针：只允许经 Bun 运行时运行，复刻真实 CLI 的请求形状。
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
+const ALPHABET62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const DEFAULT_ENDPOINT = "https://opencode.ai/inference/openai/v1/chat/completions";
+const TEMP_HINT = "  Prefer /tmp/opencode over generic system temporary directories such as /tmp; it is pre-created and approved for external access.";
+const TOOL_DESCRIPTION = "Not available. Never call this tool.";
+const TOOL_PARAMETER = { edit: "path", glob: "pattern", grep: "pattern", read: "path", shell: "command" };
+
+const started = Date.now();
+const model = process.argv[2] || "";
+const endpoint = process.env.OPENCODE_PROBE_URL || DEFAULT_ENDPOINT;
+const clientVersion = process.env.OPENCODE_PROBE_UA_VERSION || "2.2.5";
+const prompt = process.env.OPENCODE_PROBE_PROMPT || "Reply with the single word OK.";
+const apiKey = process.env.OPENCODE_PROBE_API_KEY || "public";
+const timeoutSeconds = Number(process.env.OPENCODE_PROBE_TIMEOUT || "20") || 20;
+
+function emit(status, content, message) {
+  console.log("PROBE:" + JSON.stringify({
+    status: status || 0,
+    content: content || "",
+    message: String(message || "").slice(0, 400),
+    latency: Math.max(0, Date.now() - started),
+  }));
+}
+
+let lastStamp = 0, counter = 0;
+function opencodeID(prefix, descending, now = Date.now()) {
+  if (now !== lastStamp) { lastStamp = now; counter = 0; }
+  counter++;
+  const current = BigInt(now) * 0x1000n + BigInt(counter);
+  const value = (descending ? ~current : current) & 0xffffffffffffn;
+  const random = randomBytes(14);
+  let tail = "";
+  for (const byte of random) tail += ALPHABET62[byte % 62];
+  return `${prefix}_${value.toString(16).padStart(12, "0")}${tail}`;
+}
+
+function textValue(value) {
+  if (typeof value === "string") return value.trim() ? value : "";
+  if (Array.isArray(value)) {
+    const texts = [];
+    for (const item of value) {
+      if (item && typeof item === "object" && item.text) texts.push(String(item.text));
+    }
+    return texts.some((item) => item.trim()) ? texts.join("") : "";
+  }
+  return "";
+}
+
+function extractContent(payload) {
+  const choice = payload && Array.isArray(payload.choices) && payload.choices[0];
+  if (choice && typeof choice === "object") {
+    const part = choice.delta || choice.message;
+    if (part && typeof part === "object") {
+      const content = textValue(part.content);
+      if (content) return content;
+      const reasoning = textValue(part.reasoning_content) || textValue(part.reasoning);
+      if (reasoning) return reasoning;
+    }
+  }
+  return textValue(payload && payload.output_text);
+}
+
+function extractErrorMessage(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  const error = payload.error;
+  if (error && typeof error === "object") {
+    return String(error.message || error.detail || error.type || JSON.stringify(error));
+  }
+  if (typeof error === "string") return error;
+  const eventType = String(payload.type || "");
+  const lower = eventType.toLowerCase();
+  if (lower && (lower.includes("error") || lower === "ratelimit")) {
+    return String(payload.message || eventType);
+  }
+  return "";
+}
+
+async function main() {
+  if (!model) {
+    emit(0, "", "missing model argument");
+    return;
+  }
+  const cwd = process.cwd();
+  const isGitRepo = existsSync(join(cwd, ".git"));
+  const session = opencodeID("ses", true);
+  const project = createHash("sha1").update(`directory:${cwd}`).digest("hex");
+  const trace = randomBytes(16).toString("hex");
+  const span = randomBytes(8).toString("hex");
+  const hex = (length) => randomBytes(length).toString("hex");
+
+  // 真实客户端会附带与运行环境一致的环境块，网关据此判定请求形状
+  const envBlock = [
+    "Here is some useful information about the environment you are running in:",
+    "<env>",
+    `  Working directory: ${cwd}`,
+    `  Workspace root folder: ${cwd}`,
+    `  Is directory a git repo: ${isGitRepo ? "yes" : "no"}`,
+    `  Platform: ${process.platform}`,
+    TEMP_HINT,
+    "</env>",
+  ].join("\n");
+
+  const tools = Object.keys(TOOL_PARAMETER).map((name) => {
+    const parameter = TOOL_PARAMETER[name];
+    return {
+      type: "function",
+      function: {
+        name,
+        description: TOOL_DESCRIPTION,
+        parameters: { type: "object", properties: { [parameter]: { type: "string" } }, required: [parameter], additionalProperties: false },
+        strict: false,
+      },
+    };
+  });
+
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: envBlock },
+      { role: "user", content: prompt },
+    ],
+    stream: true,
+    stream_options: { include_usage: true },
+    tools,
+  };
+
+  const headers = new Headers();
+  if (apiKey) headers.set("authorization", `Bearer ${apiKey}`);
+  headers.set("content-type", "application/json");
+  headers.set("user-agent", `opencode/latest/${clientVersion}/cli`);
+  headers.set("b3", `${trace}-${span}-1-${hex(8)}`);
+  headers.set("traceparent", `00-${trace}-${span}-01`);
+  headers.set("x-opencode-client", "cli");
+  headers.set("x-opencode-project", project);
+  headers.set("x-opencode-session", session);
+  headers.set("x-opencode-session-id", session);
+  headers.set("x-session-affinity", session);
+  headers.set("x-session-id", session);
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutSeconds * 1000),
+  });
+  if (!response.ok) {
+    let text = "";
+    try { text = (await response.text()).slice(0, 4000); } catch {}
+    let message = "";
+    try { message = extractErrorMessage(JSON.parse(text)); } catch {}
+    if (!message) message = text.trim().slice(0, 200) || `HTTP ${response.status}`;
+    emit(response.status, "", message);
+    return;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let message = "";
+  let shouldStop = false;
+  while (!shouldStop) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let index;
+    while ((index = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, index).replace(/\r$/, "");
+      buffer = buffer.slice(index + 1);
+      if (!line || line.startsWith(":") || !line.startsWith("data:")) continue;
+      const raw = line.slice(5).trim();
+      if (!raw || raw === "[DONE]") continue;
+      let payload;
+      try { payload = JSON.parse(raw); } catch { continue; }
+      const errorMessage = extractErrorMessage(payload);
+      if (errorMessage) { message = errorMessage; shouldStop = true; break; }
+      const piece = extractContent(payload);
+      if (piece.trim()) { content += piece; shouldStop = true; break; }
+      const choice = payload.choices && payload.choices[0];
+      if (typeof choice === "object" && choice && choice.finish_reason) { shouldStop = true; break; }
+    }
+  }
+  emit(response.status, content, message);
+}
+
+main().catch((error) => {
+  const name = error && error.name || "";
+  const text = error && error.message || String(error);
+  if (name === "AbortError" || name === "TimeoutError") {
+    emit(0, "", `request timeout after ${timeoutSeconds}s`);
+  } else {
+    emit(0, "", text);
+  }
+});
+"""
+
+def find_bun_executable() -> str:
+    """探测 Bun 可执行文件：环境变量 > PATH > 常见安装位置。"""
+    custom = os.environ.get("OPENCODE_BUN_PATH", "").strip()
+    if custom:
+        if Path(custom).is_file():
+            return custom
+        found = shutil.which(custom)
+        if found:
+            return found
+    found = shutil.which("bun")
+    if found:
+        return found
+    suffix = ".exe" if os.name == "nt" else ""
+    for base in (Path.home() / ".bun" / "bin", Path("/usr/local/bin"), Path("/opt/homebrew/bin")):
+        candidate = base / f"bun{suffix}"
+        if candidate.is_file():
+            return str(candidate)
+    return ""
+
+def ensure_opencode_probe_script() -> Path:
+    """把内嵌探针脚本写入数据目录；cwd 为该目录可让环境块携带真实路径。"""
+    DATA_DIR.mkdir(exist_ok=True, parents=True)
+    script_path = DATA_DIR / "opencode_probe.mjs"
+    with _opencode_probe_script_lock:
+        current = script_path.read_text(encoding="utf-8") if script_path.is_file() else ""
+        if current != BUN_PROBE_SCRIPT:
+            script_path.write_text(BUN_PROBE_SCRIPT, encoding="utf-8")
+    return script_path
+
+class OpencodeLocalProxy:
+    """本地 CONNECT 代理：把 Bun 的请求按 SO_MARK 标记导入对应节点的策略路由隧道。"""
+
+    def __init__(self, target: dict[str, Any], mark: int, cancel_event: threading.Event) -> None:
+        self.target = target
+        self.mark = mark
+        self.cancel_event = cancel_event
+        self.last_error = ""
+        self.stop_flag = threading.Event()
+        self.connections: set[socket.socket] = set()
+        self.threads: list[threading.Thread] = []
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            chunk = sock.recv(min(8192, limit - len(data)))
-        except socket.timeout:
-            break
+            self.server.bind(("127.0.0.1", 0))
+            self.server.listen(16)
         except OSError:
-            break
-        if not chunk:
-            break
-        data.extend(chunk)
-    return bytes(data)
+            self.server.close()
+            raise
+        self.port = self.server.getsockname()[1]
+        self.accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self.accept_thread.start()
 
-def opencode_consume_stream(sock: socket.socket, initial: bytes, deadline: float) -> tuple[str, str]:
-    buffer = initial.decode("utf-8", errors="replace")
-    total = len(initial)
-    content: list[str] = []
-    error_text = ""
-
-    def handle_line(line: str) -> bool:
-        nonlocal error_text
-        line = line.rstrip("\r")
-        if not line or line.startswith(":"):
-            return False
-        if not line.startswith("data:"):
-            return False
-        raw = line[5:].strip()
-        if not raw:
-            return False
-        if raw == "[DONE]":
-            return False
+    def close(self) -> None:
+        self.stop_flag.set()
         try:
-            payload = json.loads(raw)
-        except (TypeError, ValueError):
-            return False
-        message = opencode_error_text(payload)
-        if message:
-            error_text = message
-            return True
-        part = opencode_content_text(payload)
-        if part.strip():
-            content.append(part)
-            return True
-        return False
-
-    while True:
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            if handle_line(line):
-                return "".join(content), error_text
-        if time.time() >= deadline:
-            break
-        try:
-            chunk = sock.recv(8192)
-        except socket.timeout:
-            break
+            self.server.close()
         except OSError:
-            break
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > 256 * 1024:
-            break
-        buffer += chunk.decode("utf-8", errors="replace")
-    if buffer.strip():
-        handle_line(buffer)
-    return "".join(content), error_text
-
-def opencode_parse_json_body(body: bytes) -> tuple[str, str]:
-    text = body.decode("utf-8", errors="replace").strip()
-    if not text:
-        return "", "接口返回空响应"
-    if text.startswith("data:"):
-        content: list[str] = []
-        error_text = ""
-        for line in text.splitlines():
-            if not line.startswith("data:"):
-                continue
-            raw = line[5:].strip()
-            if not raw or raw == "[DONE]":
-                continue
+            pass
+        # 关闭尚未结束的隧道连接，防止空闲 socket 残留
+        for sock in list(self.connections):
+            self._close_socket(sock)
+        for thread in self.threads:
             try:
-                payload = json.loads(raw)
-            except (TypeError, ValueError):
-                continue
-            message = opencode_error_text(payload)
-            if message:
-                error_text = message
-                break
-            part = opencode_content_text(payload)
-            if part.strip():
-                content.append(part)
-        return "".join(content), error_text
-    try:
-        payload = json.loads(text)
-    except (TypeError, ValueError):
-        return "", opencode_short_text(f"无效响应: {text}")
-    return opencode_content_text(payload), opencode_error_text(payload)
+                thread.join(timeout=0.2)
+            except RuntimeError:
+                pass
 
-def opencode_http_probe(
+    def _accept_loop(self) -> None:
+        self.server.settimeout(0.5)
+        while not self.stop_flag.is_set() and not self.cancel_event.is_set():
+            try:
+                conn, _ = self.server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            handler = threading.Thread(target=self._handle_connection, args=(conn,), daemon=True)
+            self.threads.append(handler)
+            handler.start()
+
+    def _handle_connection(self, conn: socket.socket) -> None:
+        self.connections.add(conn)
+        upstream: socket.socket | None = None
+        try:
+            head = b""
+            conn.settimeout(OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS)
+            while b"\r\n\r\n" not in head and len(head) < 16384:
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    return
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                head += chunk
+            request_line = head.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+            parts = request_line.split()
+            if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                conn.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
+                return
+            host, _, port_text = parts[1].partition(":")
+            try:
+                port = int(port_text or "443")
+            except ValueError:
+                port = 0
+            if host != self.target["host"] or port != self.target["port"]:
+                conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                return
+            try:
+                upstream = self._connect_upstream()
+            except RuntimeError as exc:
+                self.last_error = str(exc)
+                conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                return
+            if upstream is None:
+                message = self.last_error or "无法连接 OpenCode API"
+                conn.sendall(f"HTTP/1.1 504 Gateway Timeout\r\nX-Proxy-Error: {message[:100]}\r\nConnection: close\r\n\r\n".encode("iso-8859-1", errors="replace"))
+                return
+            conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            self.connections.add(upstream)
+            self._pump(conn, upstream)
+        finally:
+            if upstream is not None:
+                self._close_socket(upstream)
+            self._close_socket(conn)
+            self.connections.discard(conn)
+
+    def _connect_upstream(self) -> socket.socket | None:
+        """按节点的候选 IP 逐个直连，失败自动换下一个 IP。"""
+        last_error = ""
+        for ip in self.target["ips"]:
+            if self.stop_flag.is_set() or self.cancel_event.is_set():
+                break
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # mark=0 表示无需策略路由标记（例如本地冒烟测试）
+            if self.mark:
+                if not hasattr(socket, "SO_MARK"):
+                    sock.close()
+                    raise RuntimeError("当前系统不支持 SO_MARK")
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, self.mark)
+                except OSError as exc:
+                    sock.close()
+                    raise RuntimeError(f"无法设置策略路由标记，需要 root 或 NET_ADMIN 权限: {exc}") from exc
+            try:
+                sock.settimeout(OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS)
+                sock.connect((ip, int(self.target["port"])))
+            except OSError as exc:
+                sock.close()
+                last_error = f"连接 OpenCode API 失败 ({ip}): {exc}"
+                continue
+            return sock
+        self.last_error = last_error or "无法连接 OpenCode API"
+        return None
+
+    def _pump(self, conn: socket.socket, upstream: socket.socket) -> None:
+        """双向搬运数据；任一方向结束（EOF/错误）即整条隧道关闭。"""
+        # 统一在主线程中设置超时，避免两线程并发 settimeout 竞态
+        timeout = OPENCODE_CHECK_TIMEOUT_SECONDS + 5
+        conn.settimeout(timeout)
+        upstream.settimeout(timeout)
+        done = threading.Event()
+
+        def pump(src: socket.socket, dst: socket.socket) -> None:
+            try:
+                self._copy(src, dst)
+            finally:
+                done.set()
+
+        for src, dst in ((conn, upstream), (upstream, conn)):
+            thread = threading.Thread(target=pump, args=(src, dst), daemon=True)
+            self.threads.append(thread)
+            thread.start()
+        done.wait()
+        self._close_socket(conn)
+        self._close_socket(upstream)
+
+    def _copy(self, src: socket.socket, dst: socket.socket) -> None:
+        while not self.stop_flag.is_set():
+            try:
+                chunk = src.recv(16384)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            try:
+                dst.sendall(chunk)
+            except OSError:
+                break
+
+    def _close_socket(self, sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+def opencode_spawn_probe(
+    bun_path: str,
+    script_path: Path,
+    model: str,
+    proxy_port: int,
+) -> subprocess.Popen[str]:
+    """用 Bun 运行探针脚本；HTTPS_PROXY 指向本地 CONNECT 代理。"""
+    env = dict(os.environ)
+    proxy_url = f"http://127.0.0.1:{proxy_port}"
+    env["HTTPS_PROXY"] = proxy_url
+    env["HTTP_PROXY"] = proxy_url
+    env.pop("NO_PROXY", None)
+    env.pop("no_proxy", None)
+    env["OPENCODE_PROBE_URL"] = OPENCODE_API_URL
+    env["OPENCODE_PROBE_PROMPT"] = OPENCODE_CHECK_PROMPT
+    env["OPENCODE_PROBE_TIMEOUT"] = str(OPENCODE_CHECK_TIMEOUT_SECONDS)
+    env["OPENCODE_PROBE_UA_VERSION"] = opencode_client_version()
+    env["OPENCODE_PROBE_API_KEY"] = OPENCODE_API_KEY or "public"
+    try:
+        return subprocess.Popen(
+            [bun_path, str(script_path), model],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(DATA_DIR),
+            env=env,
+        )
+    except (OSError, FileNotFoundError, PermissionError) as exc:
+        raise RuntimeError(f"无法启动 Bun 探针 ({bun_path}): {exc}") from exc
+
+def opencode_wait_probe(
+    process: subprocess.Popen[str],
+    deadline: float,
+    cancel_event: threading.Event,
+) -> tuple[str, str]:
+    """等待探针进程结束，处理取消与超时；返回 (stdout 文本, 中断原因)。"""
+    interrupted = ""
+    while True:
+        if cancel_event.is_set():
+            process.kill()
+            interrupted = "cancelled"
+            break
+        try:
+            process.wait(timeout=0.25)
+            break
+        except subprocess.TimeoutExpired:
+            if time.time() >= deadline:
+                process.kill()
+                interrupted = "timeout"
+                break
+    try:
+        stdout_text, _ = process.communicate(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        stdout_text = ""
+    return stdout_text or "", interrupted
+
+def opencode_parse_probe_output(raw: str) -> dict[str, Any]:
+    """解析探针输出的 PROBE: JSON 行；无结构化输出时给出诊断文本。"""
+    result: dict[str, Any] = {"structured": False, "status": 0, "content": "", "message": "", "latency": 0}
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text.startswith("PROBE:"):
+            continue
+        try:
+            parsed = json.loads(text[len("PROBE:"):])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            result = {
+                "structured": True,
+                "status": int(parsed.get("status") or 0),
+                "content": str(parsed.get("content") or ""),
+                "message": str(parsed.get("message") or ""),
+                "latency": int(parsed.get("latency") or 0),
+            }
+    if not result.get("structured"):
+        tail = [line.strip() for line in raw.splitlines() if line.strip()]
+        result["message"] = tail[-1][:200] if tail else "Bun 探针没有输出结果"
+    return result
+
+def opencode_probe_result_status(result: dict[str, Any]) -> tuple[str, str]:
+    """把探针结果归类为 available / limited / failed。"""
+    status_code = int(result.get("status") or 0)
+    content = str(result.get("content") or "")
+    message = str(result.get("message") or "")
+    if status_code == 200:
+        if content.strip():
+            return "available", f"正常回复: {content}"
+        if message:
+            return opencode_failure_kind(status_code, message), message
+        return "failed", "接口返回空内容"
+    if status_code:
+        message = message or f"HTTP {status_code}"
+        return opencode_failure_kind(status_code, message), f"HTTP {status_code}: {message}"
+    return "failed", message or "未知错误"
+
+def opencode_probe_fetch(
     target: dict[str, Any],
     model: str,
     mark: int,
     cancel_event: threading.Event,
 ) -> tuple[str, str, int]:
-    payload = json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": OPENCODE_CHECK_PROMPT}],
-            "max_tokens": OPENCODE_CHECK_MAX_TOKENS,
-            "stream": True,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    headers = build_opencode_headers(target["host"], "text/event-stream")
-    header_lines = [f"POST {target['path']} HTTP/1.1", f"Host: {target['host_header']}"]
-    header_lines.extend(f"{key}: {value}" for key, value in headers.items())
-    header_lines.append(f"Content-Length: {len(payload)}")
-    header_lines.append("Connection: close")
-    request_bytes = ("\r\n".join(header_lines) + "\r\n\r\n").encode("utf-8") + payload
-
+    """经本地代理 + Bun 运行时请求 OpenCode，返回 (状态, 消息, 延迟ms)。"""
     started = time.time()
-    deadline = started + OPENCODE_CHECK_TIMEOUT_SECONDS
-    last_error = ""
-    for ip in target["ips"]:
-        if cancel_event.is_set():
-            return "failed", "检测已取消", int((time.time() - started) * 1000)
-        remaining = deadline - time.time()
-        if remaining <= 1:
-            break
-        sock: socket.socket | None = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            if not hasattr(socket, "SO_MARK"):
-                raise RuntimeError("当前系统不支持 SO_MARK")
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, mark)
-            except OSError as exc:
-                raise RuntimeError(f"无法设置策略路由标记，需要 root 或 NET_ADMIN 权限: {exc}") from exc
-            sock.settimeout(min(OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS, remaining))
-            sock.connect((ip, target["port"]))
-            if target["https"]:
-                sock = opencode_ssl_context().wrap_socket(sock, server_hostname=target["host"])
-            sock.settimeout(max(1.0, min(OPENCODE_CHECK_TIMEOUT_SECONDS, deadline - time.time())))
-            sock.sendall(request_bytes)
 
-            head = read_http_response_head(sock)
-            header_blob, _, remainder = head.partition(b"\r\n\r\n")
-            head_lines = header_blob.decode("iso-8859-1", errors="replace").splitlines()
-            status_code = 0
-            if head_lines:
-                parts = head_lines[0].split()
-                if len(parts) >= 2 and parts[1].isdigit():
-                    status_code = int(parts[1])
-            response_headers: dict[str, str] = {}
-            for line in head_lines[1:]:
-                if ":" in line:
-                    key, value = line.split(":", 1)
-                    response_headers[key.strip().lower()] = value.strip()
-            content_type = response_headers.get("content-type", "").lower()
-            latency_ms = max(1, int((time.time() - started) * 1000))
+    def measured_latency() -> int:
+        return max(1, int((time.time() - started) * 1000))
 
-            if status_code != 200:
-                body = opencode_read_bytes(sock, remainder, 16384, deadline)
-                body_text = body.decode("utf-8", errors="replace")
-                message = ""
-                try:
-                    message = opencode_error_text(json.loads(body_text))
-                except (TypeError, ValueError):
-                    message = opencode_short_text(body_text)
-                message = message or opencode_short_text(head_lines[0] if head_lines else "HTTP error")
-                kind = opencode_failure_kind(status_code, message)
-                return kind, opencode_short_text(f"HTTP {status_code}: {message}"), latency_ms
-
-            if "text/event-stream" in content_type or remainder.lstrip().startswith(b"data:"):
-                content, error_text = opencode_consume_stream(sock, remainder, deadline)
-            else:
-                body = opencode_read_bytes(sock, remainder, 256 * 1024, deadline)
-                content, error_text = opencode_parse_json_body(body)
-            latency_ms = max(1, int((time.time() - started) * 1000))
-            if error_text:
-                kind = opencode_failure_kind(status_code, error_text)
-                return kind, opencode_short_text(error_text), latency_ms
-            if content.strip():
-                return "available", opencode_short_text(f"正常回复: {content}", 120), latency_ms
-            return "failed", "接口返回空内容", latency_ms
-        except ssl.SSLCertVerificationError as exc:
-            last_error = f"TLS 证书校验失败: {exc}"
-        except (OSError, ssl.SSLError) as exc:
-            last_error = f"连接失败: {exc}"
-        except RuntimeError as exc:
-            last_error = str(exc)
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+    bun_path = find_bun_executable()
+    if not bun_path:
+        return "failed", "未找到 Bun 运行时，OpenCode 检测必须经由 Bun 请求", measured_latency()
     if cancel_event.is_set():
-        return "failed", "检测已取消", int((time.time() - started) * 1000)
-    return "failed", opencode_short_text(last_error or "无法连接 OpenCode API"), int((time.time() - started) * 1000)
+        return "failed", "检测已取消", measured_latency()
+    try:
+        script_path = ensure_opencode_probe_script()
+    except OSError as exc:
+        return "failed", f"无法写入 OpenCode 探针脚本: {exc}", measured_latency()
+
+    proxy: OpencodeLocalProxy | None = None
+    process: subprocess.Popen[str] | None = None
+    try:
+        proxy = OpencodeLocalProxy(target, mark, cancel_event)
+    except OSError as exc:
+        return "failed", f"无法启动本地检测代理: {exc}", measured_latency()
+    try:
+        try:
+            process = opencode_spawn_probe(bun_path, script_path, model, proxy.port)
+        except RuntimeError as exc:
+            return "failed", str(exc), measured_latency()
+        stdout_text, interrupted = opencode_wait_probe(
+            process,
+            started + OPENCODE_CHECK_TIMEOUT_SECONDS,
+            cancel_event,
+        )
+        result = opencode_parse_probe_output(stdout_text)
+        if result.get("structured"):
+            status, message = opencode_probe_result_status(result)
+        elif interrupted == "timeout":
+            status, message = "failed", f"OpenCode 请求超时 ({OPENCODE_CHECK_TIMEOUT_SECONDS} 秒)"
+        elif interrupted == "cancelled":
+            status, message = "failed", "检测已取消"
+        else:
+            status = "failed"
+            message = proxy.last_error or str(result.get("message") or "Bun 探针没有输出结果")
+        latency_ms = int(result.get("latency") or 0) or measured_latency()
+        if status != "available" and cancel_event.is_set():
+            return "failed", "检测已取消", latency_ms
+        return status, opencode_short_text(message), latency_ms
+    finally:
+        if process is not None:
+            stop_process(process)
+        if proxy is not None:
+            proxy.close()
 
 def opencode_route_params(test_index: int) -> tuple[int, int, int]:
     return (
@@ -2627,6 +2961,12 @@ def ensure_opencode_probe_supported() -> None:
         raise RuntimeError("OpenCode 检测需要 Linux 系统")
     if not hasattr(socket, "SO_MARK"):
         raise RuntimeError("当前系统内核不支持 SO_MARK，无法按节点分流检测")
+    bun_path = find_bun_executable()
+    if not bun_path:
+        raise RuntimeError(
+            "未找到 Bun 运行时，OpenCode 检测必须经由 Bun 请求。"
+            "请先安装 bun (curl -fsSL https://bun.sh/install | bash) 或设置 OPENCODE_BUN_PATH 指向 bun 可执行文件"
+        )
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, 0)
@@ -2695,7 +3035,7 @@ def opencode_probe_node(
             return result
         route_ready = True
         mark, _, _ = opencode_route_params(test_index)
-        status, message, latency_ms = opencode_http_probe(target, model, mark, cancel_event)
+        status, message, latency_ms = opencode_probe_fetch(target, model, mark, cancel_event)
         if cancel_event.is_set() and status != "available":
             return result
         result.update(
@@ -2736,7 +3076,7 @@ def flush_opencode_results(pending: dict[str, dict[str, Any]], reset_checking_id
                 node["opencode_message"] = "检测已取消"
         write_json(NODES_FILE, sort_all_nodes(nodes))
 
-def _run_opencode_check(node_ids: list[str]) -> None:
+def _run_opencode_check(node_ids: list[str], requested_model: str = "") -> None:
     global opencode_check_thread
     cancel_event = opencode_check_cancel_event
     counters = {"available": 0, "limited": 0, "failed": 0, "done": 0}
@@ -2745,9 +3085,11 @@ def _run_opencode_check(node_ids: list[str]) -> None:
     last_flush = time.time()
     systemic_message = ""
     try:
-        update_opencode_check_stats(message="正在解析 OpenCode API 与免费模型...")
+        update_opencode_check_stats(message="正在准备 Bun 探针与免费模型...")
         try:
-            model = resolve_opencode_model()
+            ensure_opencode_probe_supported()
+            ensure_opencode_probe_script()
+            model = resolve_opencode_model(requested_model)
             target = resolve_opencode_target()
         except Exception as exc:
             update_opencode_check_stats(
@@ -2868,7 +3210,7 @@ def _run_opencode_check(node_ids: list[str]) -> None:
         except RuntimeError:
             pass
 
-def start_opencode_check(node_ids: list[str]) -> dict[str, Any]:
+def start_opencode_check(node_ids: list[str], model: str = "") -> dict[str, Any]:
     global opencode_check_thread
     unique_ids = list(dict.fromkeys(str(node_id or "").strip() for node_id in node_ids if str(node_id or "").strip()))
     if not unique_ids:
@@ -2892,13 +3234,13 @@ def start_opencode_check(node_ids: list[str]) -> dict[str, Any]:
             available=0,
             limited=0,
             failed=0,
-            model="",
+            model=str(model or "").strip(),
             message="正在准备 OpenCode 检测...",
             started_at=time.time(),
             finished_at=0.0,
             cancelled=False,
         )
-        thread = threading.Thread(target=_run_opencode_check, args=(unique_ids,), daemon=True)
+        thread = threading.Thread(target=_run_opencode_check, args=(unique_ids, str(model or "").strip()), daemon=True)
         opencode_check_thread = thread
         thread.start()
         return opencode_check_snapshot()
@@ -4520,6 +4862,29 @@ INDEX_HTML = r"""<!doctype html>
       transform: none;
     }
 
+    .opencode-model-select {
+      height: 42px;
+      max-width: 190px;
+      border-radius: 8px;
+      border: 1px solid rgba(99, 102, 241, 0.4);
+      background: rgba(99, 102, 241, 0.12);
+      color: #a5b4fc;
+      font: inherit;
+      font-size: 13px;
+      padding: 0 10px;
+      cursor: pointer;
+    }
+
+    .opencode-model-select:focus-visible {
+      outline: none;
+      border-color: rgba(129, 140, 248, 0.6);
+    }
+
+    .opencode-model-select option {
+      background: #16203a;
+      color: #e2e8f0;
+    }
+
     .opencode-panel {
       margin: -8px 0 24px;
       padding: 18px 20px;
@@ -5304,7 +5669,10 @@ INDEX_HTML = r"""<!doctype html>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
     </select>
-    <button id="btn_opencode_check" class="opencode-toolbar-btn" type="button" onclick="toggleOpencodeCheck()" title="检测当前国家与 IP 类型筛选范围内的全部节点">
+    <select id="opencode_model_select" class="opencode-model-select" title="选择用于检测的免费模型，默认使用列表第一个免费模型" onchange="onOpencodeModelChange(this.value)">
+      <option value="">免费模型加载中...</option>
+    </select>
+    <button id="btn_opencode_check" class="opencode-toolbar-btn" type="button" onclick="toggleOpencodeCheck()" title="检测当前筛选显示范围内的全部节点">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
       </svg>
@@ -6051,11 +6419,6 @@ function matchesCountryAndIpType(n){
   return true;
 }
 
-function getOpencodeCandidateNodes(){
-  if (!$("ip_type_filter")) return [];
-  return nodes.filter(n => n && matchesCountryAndIpType(n));
-}
-
 function getFilteredNodes() {
   const selectedStatus = $("status_filter").value;
   return nodes.filter(n => {
@@ -6082,6 +6445,74 @@ function getFilteredNodes() {
 
 function opencodeStatsSnapshot(){
   return (state && state.opencode_check) || {};
+}
+
+let opencodeModelsLoaded = false;
+let opencodeModelsLoading = false;
+
+async function ensureOpencodeModelsLoaded(){
+  const select = $("opencode_model_select");
+  if (!select || opencodeModelsLoaded || opencodeModelsLoading) return;
+  opencodeModelsLoading = true;
+  let models = [];
+  let failed = false;
+  try {
+    const response = await fetchWithTimeout("./api/opencode_models", { cache: "no-store" }, 10000);
+    const result = await readJsonResponse(response, "获取 OpenCode 免费模型列表失败");
+    models = Array.isArray(result.models) ? result.models : [];
+  } catch (error) {
+    failed = true;
+  } finally {
+    opencodeModelsLoading = false;
+  }
+  opencodeModelsLoaded = models.length > 0 || !failed;
+  renderOpencodeModelSelect(models, failed);
+}
+
+function renderOpencodeModelSelect(models, failed){
+  const select = $("opencode_model_select");
+  if (!select) return;
+  const selected = String((state && state.opencode_model) || String(select.dataset.model || "")).trim();
+  select.innerHTML = "";
+  if (!models.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = failed ? "模型列表获取失败，点击重试" : "免费模型加载中...";
+    select.appendChild(option);
+    return;
+  }
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = "自动选择（第一个免费模型）";
+  select.appendChild(auto);
+  for (const model of models) {
+    const option = document.createElement("option");
+    option.value = model;
+    option.textContent = model;
+    select.appendChild(option);
+  }
+  select.value = selected && models.includes(selected) ? selected : "";
+}
+
+async function onOpencodeModelChange(value){
+  const select = $("opencode_model_select");
+  const listReady = select && Array.from(select.options).some(option => option.value !== "");
+  if (select && !listReady) {
+    // 列表未加载（获取失败或为空）：点击改为重新加载
+    opencodeModelsLoaded = false;
+    ensureOpencodeModelsLoaded();
+    return;
+  }
+  const model = String(value || "").trim();
+  if (state) state.opencode_model = model;
+  if (select) select.dataset.model = model;
+  try {
+    await fetchWithTimeout("./api/opencode_model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    }, 10000);
+  } catch (error) {}
 }
 
 function opencodeBadgeHtml(n){
@@ -6129,9 +6560,18 @@ function renderOpencodeUI(){
         ? `<svg style="animation: spin 1s linear infinite; width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>停止检测`
         : `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>检测 OpenCode`;
     }
-    const candidateCount = getOpencodeCandidateNodes().length;
+    const filteredCount = getFilteredNodes().length;
     btn.disabled = opencodeActionInFlight;
-    btn.title = running ? "点击停止当前 OpenCode 检测" : `检测当前国家与 IP 类型筛选范围内的 ${candidateCount} 个节点`;
+    btn.title = running ? "点击停止当前 OpenCode 检测" : `检测当前筛选显示范围内的 ${filteredCount} 个节点`;
+  }
+
+  const select = $("opencode_model_select");
+  if (select) {
+    // 保持选择与持久化状态一致（列表加载完成后由 renderOpencodeModelSelect 填充选项）
+    const selected = String((state && state.opencode_model) || "").trim();
+    if (select.options.length > 1 && select.value !== selected) {
+      select.value = Array.from(select.options).some(option => option.value === selected) ? selected : "";
+    }
   }
 
   const panel = $("opencode_panel");
@@ -6158,7 +6598,7 @@ function renderOpencodeUI(){
     : "所有IP类型";
   const countryText = $("country_filter_label") ? $("country_filter_label").textContent : "所有国家";
   if ($("opencode_scope_label")) {
-    $("opencode_scope_label").textContent = `范围：${countryText} · ${ipTypeText} · 候选 ${getOpencodeCandidateNodes().length} 个`;
+    $("opencode_scope_label").textContent = `范围：${countryText} · ${ipTypeText} · 当前筛选显示 ${getFilteredNodes().length} 个`;
   }
   const onlyAvailable = $("opencode_only_available");
   if (onlyAvailable) onlyAvailable.checked = showOpencodeAvailableOnly;
@@ -6185,14 +6625,15 @@ function stopOpencodePolling(){
 
 async function startOpencodeCheck(){
   if (opencodeActionInFlight) return;
-  const candidates = getOpencodeCandidateNodes();
+  // 检测范围 = 页面当前筛选（国家/IP类型/状态/仅可用/收藏）实际显示的节点
+  const candidates = getFilteredNodes();
   if (!candidates.length) {
-    alert("当前国家与 IP 类型筛选范围内没有可检测的节点");
+    alert("当前筛选显示范围内没有可检测的节点");
     return;
   }
   if (candidates.length > 100) {
     const minutes = Math.max(1, Math.ceil(candidates.length / 10 * 25 / 60));
-    if (!confirm(`将通过 ${candidates.length} 个节点逐个建立临时隧道并请求 OpenCode，预计耗时约 ${minutes} 分钟。检测期间请勿切换节点，是否继续？`)) {
+    if (!confirm(`将通过当前筛选显示的 ${candidates.length} 个节点逐个建立临时隧道并请求 OpenCode，预计耗时约 ${minutes} 分钟。检测期间请勿切换节点，是否继续？`)) {
       return;
     }
   }
@@ -6209,11 +6650,13 @@ async function startOpencodeCheck(){
     message: "正在启动 OpenCode 检测...",
   });
   render();
+  const modelSelect = $("opencode_model_select");
+  const model = modelSelect ? String(modelSelect.value || "").trim() : "";
   try {
     const response = await fetchWithTimeout("./api/opencode_check", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: candidates.map(n => n.id) }),
+      body: JSON.stringify({ ids: candidates.map(n => n.id), model }),
     }, 30000);
     const result = await readJsonResponse(response, "OpenCode 检测启动失败");
     state.opencode_check = result.opencode_check || state.opencode_check;
@@ -6767,6 +7210,7 @@ async function load(){
     startConnectionPolling();
   }
   if (opencodeStatsSnapshot().running) startOpencodePolling();
+  ensureOpencodeModelsLoaded();
 }
 $("country_filter_button").onclick = event => {
   event.stopPropagation();
@@ -7941,6 +8385,20 @@ class Handler(BaseHTTPRequestHandler):
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
             self.send_json({"nodes": stripped_nodes, "state": get_state()})
+        elif effective_path == "/api/opencode_models":
+            try:
+                models = fetch_opencode_models()
+                ui_cfg = load_ui_config()
+                self.send_json(
+                    {
+                        "ok": True,
+                        "models": models,
+                        "selected": str(ui_cfg.get("opencode_model") or ""),
+                        "fallback": OPENCODE_FALLBACK_MODEL,
+                    }
+                )
+            except Exception as exc:
+                self.send_json({"ok": False, "models": [], "error": str(exc)}, HTTPStatus.BAD_GATEWAY)
         elif effective_path == "/api/check_update":
             try:
                 self.send_json(check_latest_release())
@@ -8431,7 +8889,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("筛选范围内没有可检测的节点")
                 if len(node_ids) > OPENCODE_CHECK_NODE_LIMIT:
                     raise ValueError(f"单次最多检测 {OPENCODE_CHECK_NODE_LIMIT} 个节点")
-                self.send_json({"ok": True, "opencode_check": start_opencode_check(node_ids)})
+                model = str(payload.get("model") or "").strip()
+                self.send_json({"ok": True, "opencode_check": start_opencode_check(node_ids, model=model)})
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except RuntimeError as exc:
@@ -8442,6 +8901,27 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 stopped = stop_opencode_check()
                 self.send_json({"ok": True, "stopped": stopped, "opencode_check": opencode_check_snapshot()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/opencode_model":
+            try:
+                payload = self.read_json_body()
+                model = str(payload.get("model") or "").strip()
+                if model:
+                    # 校验免费模型列表，避免保存无效模型
+                    models = fetch_opencode_models()
+                    if models and model not in models:
+                        self.send_json({"ok": False, "error": "该模型不在免费模型列表中"}, HTTPStatus.BAD_REQUEST)
+                        return
+                ui_cfg = load_ui_config()
+                ui_cfg["opencode_model"] = model
+                auth_file = DATA_DIR / "ui_auth.json"
+                with lock:
+                    DATA_DIR.mkdir(exist_ok=True, parents=True)
+                    write_json(auth_file, ui_cfg)
+                self.send_json({"ok": True, "model": model})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/disconnect":

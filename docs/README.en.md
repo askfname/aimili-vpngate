@@ -19,6 +19,7 @@ AimiliVPN uses Python's standard library to manage VPNGate nodes. It provides no
 | --- | --- |
 | Web dashboard | TCP `8787`, a private path, username, and password |
 | Local proxy | `127.0.0.1:7928`, HTTP, HTTPS `CONNECT`, and SOCKS5 |
+| OpenCode checks | Filter nodes by country + IP type, then test public free models through each node's exit IP |
 | Source deployment | x64, x86, ARM64, and ARM32 Linux |
 | Update channel | GitHub `main` stable branch / latest stable Release |
 
@@ -35,6 +36,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/i
 ```
 
 The installer prints the complete Web URL, private path, username, and password. Run `ml` to open the management menu.
+
+For unattended installation, explicitly skip the first-run prompts and generate the Web path and credentials automatically:
+
+```bash
+AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/install.sh)
+```
 
 > [!TIP]
 > Enable TUN/TAP in the VPS control panel and verify that `/dev/net/tun` exists. The Web dashboard uses TCP `8787` by default; restrict firewall access to your own IP whenever possible.
@@ -55,12 +62,6 @@ bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/i
 ```
 
 The installer deploys to `/opt/aimilivpn` and registers a system service.
-
-For unattended installation, explicitly skip the first-run prompts and generate the Web path and credentials automatically:
-
-```bash
-AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/askfname/aimili-vpngate/main/install.sh)
-```
 
 ```bash
 ml                 # Open the management menu
@@ -115,7 +116,65 @@ curl -x http://127.0.0.1:7928 https://api.ipify.org
 curl --proxy socks5h://127.0.0.1:7928 https://api.ipify.org
 ```
 
-### 4. Connect from another computer
+<details>
+<summary><strong>Shell environment variables and Python example</strong></summary>
+
+```bash
+export http_proxy="http://127.0.0.1:7928"
+export https_proxy="http://127.0.0.1:7928"
+curl https://api.ipify.org
+```
+
+```python
+import requests
+
+proxies = {
+  "http": "http://127.0.0.1:7928",
+  "https": "http://127.0.0.1:7928",
+}
+
+response = requests.get("https://api.ipify.org", proxies=proxies, timeout=20)
+print(response.text)
+```
+
+</details>
+
+### 4. Check OpenCode nodes
+
+**Check OpenCode** in the Web toolbar opens temporary test tunnels concurrently for all nodes matching the current **country + IP type** filters, then requests OpenCode public free models through each node's exit IP. The check uses only country and IP type filters, ignoring availability and favorites, so it covers every node in the selected scope.
+
+- **Available:** The node exit returns a non-empty model response; OpenCode's free quota can be used.
+- **Quota exhausted:** The response indicates a quota limit, such as `402`, `429`, or Free usage limit.
+- **Unavailable:** Tunnel setup, TLS/connection, or authentication fails, or the response is empty.
+- **Not checked:** No check has been run yet.
+- Stop the check at any time. Results and progress update live, and **Show available only** filters successful nodes.
+- Checks temporarily use multiple `tun` interfaces and policy routes. Node switching and manual tests are disabled while a check runs; wait for it to finish or stop it first.
+
+> The check requires Linux TUN/TAP, OpenVPN, `iproute2`, `root`/`NET_ADMIN` privileges, and the **Bun runtime**; Windows/macOS clients cannot run it. The installer installs Bun automatically. Set `OPENCODE_BUN_PATH` to select a `bun` executable. Public-channel quotas are based on node exit IP and do not imply long-term stability of third-party nodes.
+
+<details>
+<summary><strong>OpenCode check environment variables</strong></summary>
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `OPENCODE_API_BASE` | `https://opencode.ai/inference/v1` | Public API root (model list) |
+| `OPENCODE_API_URL` | `https://opencode.ai/inference/openai/v1/chat/completions` | Completion endpoint used for checks |
+| `OPENCODE_MODELS_URL` | `${OPENCODE_API_BASE}/models` | Free-model list endpoint |
+| `OPENCODE_API_KEY` | `public` | Bearer value for the public channel |
+| `OPENCODE_MODEL` | Empty (automatically selects a free model) | Check model; takes precedence over the page dropdown |
+| `OPENCODE_FALLBACK_MODEL` | `beam-free` | Fallback if the model list is unavailable |
+| `OPENCODE_CHECK_WORKERS` | `10` | Concurrent test tunnels, range 1–24 |
+| `OPENCODE_CHECK_TIMEOUT_SECONDS` | `20` | Per-node API request timeout |
+| `OPENCODE_OPENVPN_TIMEOUT_SECONDS` | `12` | Per-node tunnel setup timeout |
+| `OPENCODE_CHECK_NODE_LIMIT` | `2000` | Maximum nodes per check |
+| `OPENCODE_BUN_PATH` | Empty (auto-detect PATH and common install locations) | Path to the Bun executable |
+| `OPENCODE_EXTRA_HEADERS` | Empty | Extra request headers as a JSON object string (model list only) |
+
+Restart the service or container for environment variable changes to take effect.
+
+</details>
+
+### 5. Connect from another computer
 
 The proxy listens on the VPS loopback address by default. Use an SSH tunnel instead of exposing it publicly:
 

@@ -62,13 +62,13 @@ if [ "$PKG_MGR" = "apt-get" ]; then
     echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
     apt-get update -q || true
     echo -e "  -> 正在运行 apt-get install 安装基础依赖包..."
-    apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
+    apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 unzip
 elif [ "$PKG_MGR" = "apk" ]; then
     echo -e "  -> 正在运行 apk update 更新软件源清单..."
     apk update || true
     echo -e "  -> 正在运行 apk add 安装基础依赖包..."
     # bash is required for this script itself and some internal logic
-    apk add openvpn curl git ca-certificates iptables iproute2 psmisc python3 bash
+    apk add openvpn curl git ca-certificates iptables iproute2 psmisc python3 bash unzip
 elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
     echo -e "  -> 正在运行 $PKG_MGR 安装基础依赖包..."
     if [ "$OS_TYPE" != "fedora" ] && [ "$OS_TYPE" != "amzn" ]; then
@@ -76,8 +76,20 @@ elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
         $PKG_MGR install -y epel-release || true
     fi
     # Try installing packages. Note: iproute or iproute2
-    $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute psmisc python3 || \
-    $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
+    $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute psmisc python3 unzip || \
+    $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 unzip
+fi
+
+# 1.5 Install Bun runtime (required by OpenCode free quota check)
+if ! command -v bun >/dev/null 2>&1; then
+    echo -e "  -> 正在安装 Bun 运行时 (OpenCode 免费额度检测必需)..."
+    if curl -fsSL https://bun.sh/install | BUN_INSTALL="/usr/local" bash >/tmp/bun_install.log 2>&1 \
+        && /usr/local/bin/bun --version >/dev/null 2>&1; then
+        echo -e "${GREEN}  -> Bun 运行时安装成功。${PLAIN}"
+    else
+        echo -e "${YELLOW}  -> 警告: Bun 安装失败，详情见 /tmp/bun_install.log。${PLAIN}"
+        echo -e "     OpenCode 免费额度检测需手动安装 bun (curl -fsSL https://bun.sh/install | bash)。${PLAIN}"
+    fi
 fi
 
 # 4. Clone or pull the repository
