@@ -13,6 +13,13 @@
 
 </div>
 
+如果你觉得这个项目对你有帮助，欢迎点击下方的链接支持我们，你的支持是我们持续维护的动力。
+
+<p align="center">
+  <a href="https://ko-fi.com/playlaboratory"><img src="https://img.shields.io/badge/Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="在 Ko-fi 上支持我们"></a>
+  <a href="https://afdian.com/a/playlab"><img src="https://img.shields.io/badge/Afdian-946CE6?style=for-the-badge&logo=afdian&logoColor=white" alt="在爱发电上支持我们"></a>
+</p>
+
 AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与检测、连接切换、Web 管理后台，以及共用一个端口的 HTTP、HTTPS 网站代理和 SOCKS5 代理服务。
 
 | 项目 | 默认值或支持范围 |
@@ -141,7 +148,7 @@ print(response.text)
 
 ### 4. 一键检测 OpenCode 节点
 
-Web 工具栏的“检测 OpenCode”会对当前“国家 + IP 类型”筛选结果中的全部节点并发建立临时测试隧道，并通过各节点出口请求 OpenCode 公开免费模型。检测只使用国家和 IP 类型筛选，忽略可用状态与收藏过滤，确保覆盖当前范围内的所有节点。
+Web 工具栏的“检测 OpenCode”会对当前筛选结果中的全部节点并发建立临时测试隧道，并通过各节点出口请求 OpenCode 公开免费模型。
 
 - **可用**：节点出口成功返回非空模型回复，可直接使用 OpenCode 免费额度。
 - **额度用尽**：返回 `402`、`429` 或 Free usage limit 等额度限制。

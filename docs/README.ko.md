@@ -13,6 +13,13 @@
 
 </div>
 
+이 프로젝트가 도움이 되었다면 아래 링크를 통해 후원해 주세요. 여러분의 후원은 프로젝트를 계속 유지 관리하는 데 큰 힘이 됩니다.
+
+<p align="center">
+  <a href="https://ko-fi.com/playlaboratory"><img src="https://img.shields.io/badge/Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Ko-fi에서 후원하기"></a>
+  <a href="https://afdian.com/a/playlab"><img src="https://img.shields.io/badge/Afdian-946CE6?style=for-the-badge&logo=afdian&logoColor=white" alt="爱发电에서 후원하기"></a>
+</p>
+
 AimiliVPN은 Python 표준 라이브러리로 VPNGate 노드를 관리하며 노드 검색과 테스트, 연결 전환, Web 관리 화면, HTTP / HTTPS 웹사이트 프록시 및 SOCKS5 접속을 제공합니다.
 
 | 항목 | 기본값 또는 지원 범위 |
@@ -140,7 +147,7 @@ print(response.text)
 
 ### 4. OpenCode 노드 검사
 
-Web 도구 모음의 “OpenCode 검사”는 현재 “국가 + IP 유형” 필터 결과에 포함된 모든 노드에 임시 테스트 터널을 동시에 만들고 각 노드 출구 IP를 통해 OpenCode 공개 무료 모델을 요청합니다. 검사는 국가와 IP 유형 필터만 적용하며 가용 상태와 즐겨찾기 필터는 무시해 선택 범위의 모든 노드를 검사합니다.
+Web 도구 모음의 “OpenCode 검사”는 현재 필터 결과에 포함된 모든 노드에 임시 테스트 터널을 동시에 만들고 각 노드 출구 IP를 통해 OpenCode 공개 무료 모델을 요청합니다.
 
 - **사용 가능:** 노드 출구에서 비어 있지 않은 모델 응답을 받아 OpenCode 무료 할당량을 사용할 수 있습니다.
 - **할당량 소진:** `402`, `429` 또는 Free usage limit 등의 할당량 제한 응답입니다.

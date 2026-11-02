@@ -13,6 +13,13 @@
 
 </div>
 
+このプロジェクトがお役に立ちましたら、以下のリンクからご支援いただけると幸いです。皆さまのご支援が継続的なメンテナンスの励みになります。
+
+<p align="center">
+  <a href="https://ko-fi.com/playlaboratory"><img src="https://img.shields.io/badge/Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Ko-fi で支援する"></a>
+  <a href="https://afdian.com/a/playlab"><img src="https://img.shields.io/badge/Afdian-946CE6?style=for-the-badge&logo=afdian&logoColor=white" alt="愛発電で支援する"></a>
+</p>
+
 AimiliVPN は Python 標準ライブラリで VPNGate ノードを管理し、ノード取得・テスト、接続切り替え、Web 管理画面、HTTP / HTTPS サイト用プロキシと SOCKS5 を提供します。
 
 | 項目 | デフォルトまたは対応範囲 |
@@ -140,7 +147,7 @@ print(response.text)
 
 ### 4. OpenCode ノードを検査
 
-Web ツールバーの「OpenCode 検査」は、現在の「国 + IP 種別」フィルターに一致するすべてのノードに一時テストトンネルを並行して作成し、各ノードの出口から OpenCode の公開無料モデルへリクエストします。検査では国と IP 種別のみを使用し、可用性とお気に入りのフィルターは無視して、選択範囲の全ノードを対象にします。
+Web ツールバーの「OpenCode 検査」は、現在のフィルター結果に含まれるすべてのノードに一時テストトンネルを並行して作成し、各ノードの出口から OpenCode の公開無料モデルへリクエストします。
 
 - **利用可能：** ノード出口から空でないモデル応答が返り、OpenCode の無料枠を利用できます。
 - **枠を使い切り：** `402`、`429`、Free usage limit などの利用制限が返されました。

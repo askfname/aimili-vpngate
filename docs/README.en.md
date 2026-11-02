@@ -13,6 +13,13 @@
 
 </div>
 
+If you find this project helpful, please consider supporting us using one of the links below. Your support helps us maintain the project.
+
+<p align="center">
+  <a href="https://ko-fi.com/playlaboratory"><img src="https://img.shields.io/badge/Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Support us on Ko-fi"></a>
+  <a href="https://afdian.com/a/playlab"><img src="https://img.shields.io/badge/Afdian-946CE6?style=for-the-badge&logo=afdian&logoColor=white" alt="Support us on Afdian"></a>
+</p>
+
 AimiliVPN uses Python's standard library to manage VPNGate nodes. It provides node discovery and testing, connection switching, a Web dashboard, and HTTP, HTTPS website proxying, and SOCKS5 access on one local port.
 
 | Item | Default or supported range |
@@ -141,7 +148,7 @@ print(response.text)
 
 ### 4. Check OpenCode nodes
 
-**Check OpenCode** in the Web toolbar opens temporary test tunnels concurrently for all nodes matching the current **country + IP type** filters, then requests OpenCode public free models through each node's exit IP. The check uses only country and IP type filters, ignoring availability and favorites, so it covers every node in the selected scope.
+**Check OpenCode** in the Web toolbar opens temporary test tunnels concurrently for all nodes in the current filtered results, then requests OpenCode public free models through each node's exit IP.
 
 - **Available:** The node exit returns a non-empty model response; OpenCode's free quota can be used.
 - **Quota exhausted:** The response indicates a quota limit, such as `402`, `429`, or Free usage limit.
