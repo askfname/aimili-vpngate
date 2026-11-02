@@ -885,6 +885,23 @@ class ManagerLogicTests(unittest.TestCase):
         ):
             self.assertIn(marker, script)
 
+    def test_find_bun_executable_prefers_explicit_path(self) -> None:
+        # 走真实函数（不 mock），可暴露模块级导入缺失等运行期错误
+        real_bun = manager.find_bun_executable()
+        self.assertTrue(real_bun == "" or Path(real_bun).is_file())
+        fake = str(Path(manager.__file__).with_name("fake_bun_probe.exe"))
+        if getattr(manager.os, "name", "") == "nt":
+            fake_exe = Path(tempfile.gettempdir()) / "aimili_fake_bun.exe"
+            fake_exe.write_bytes(b"")
+            try:
+                with mock.patch.dict(manager.os.environ, {"OPENCODE_BUN_PATH": str(fake_exe)}):
+                    self.assertEqual(str(fake_exe), manager.find_bun_executable())
+            finally:
+                fake_exe.unlink(missing_ok=True)
+        else:
+            with mock.patch.dict(manager.os.environ, {"OPENCODE_BUN_PATH": "/nonexistent/bun/path"}):
+                self.assertNotEqual("/nonexistent/bun/path", manager.find_bun_executable())
+
     def test_bun_probe_script_syntax_is_valid(self) -> None:
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed; Bun probe script check skipped")

@@ -11,6 +11,7 @@ import secrets
 import select
 import shlex
 import signal
+import shutil
 import socket
 import ssl
 import subprocess
@@ -6483,7 +6484,7 @@ function renderOpencodeModelSelect(models, failed){
   }
   const auto = document.createElement("option");
   auto.value = "";
-  auto.textContent = "自动选择（第一个免费模型）";
+  auto.textContent = "自动选择";
   select.appendChild(auto);
   for (const model of models) {
     const option = document.createElement("option");
