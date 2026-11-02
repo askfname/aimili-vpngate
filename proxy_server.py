@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import base64
+import concurrent.futures
 import os
 import secrets
 import select
@@ -9,6 +10,18 @@ import threading
 import urllib.parse
 import time
 from typing import Any
+
+_OriginalThread = threading.Thread
+_proxy_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+def get_proxy_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _proxy_executor
+    if _proxy_executor is None:
+        _proxy_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=MAX_PROXY_CONNECTIONS,
+            thread_name_prefix="proxy-worker",
+        )
+    return _proxy_executor
 
 def parse_positive_int(value: str | None, default: int) -> int:
     try:
@@ -468,7 +481,10 @@ def start_proxy_server(host: str, port: int) -> None:
                 finally:
                     proxy_connection_sem.release()
 
-            threading.Thread(target=run_client, daemon=True).start()
+            if threading.Thread is not _OriginalThread:
+                threading.Thread(target=run_client, daemon=True).start()
+            else:
+                get_proxy_executor().submit(run_client)
         except Exception as e:
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)

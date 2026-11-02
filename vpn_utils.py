@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -280,38 +281,31 @@ def tcp_latency_ms(host: str, port: int, dev: str | None = None) -> int:
 
 def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
     dev = get_physical_interface()
-    # 1. Try ping with interface binding
-    if dev:
-        try:
-            cmd = ["ping", "-c", "1", "-W", "2", "-I", dev, host]
-            res = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=2
-            )
-            if res.returncode == 0:
-                match = re.search(r"time=([\d.]+)\s*ms", res.stdout)
-                if match:
-                    val = int(float(match.group(1)))
-                    if val > 0:
-                        return val
-        except Exception:
-            pass
+    # 1. 优先使用套接字 TCP 探测目标服务端口（无进程派生开销，速度快且省资源）
+    if port > 0:
+        tcp_val = tcp_latency_ms(host, port, dev)
+        if tcp_val > 0:
+            return tcp_val
 
-    # 2. Try ping without interface binding
+    # 2. ICMP ping 兜底（适配不同操作系统参数）
+    is_win = sys.platform == "win32"
+    if is_win:
+        ping_cmd = ["ping", "-n", "1", "-w", "1000", host]
+    elif dev:
+        ping_cmd = ["ping", "-c", "1", "-W", "2", "-I", dev, host]
+    else:
+        ping_cmd = ["ping", "-c", "1", "-W", "2", host]
+
     try:
-        cmd = ["ping", "-c", "1", "-W", "2", host]
         res = subprocess.run(
-            cmd,
+            ping_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=2
+            timeout=2,
         )
         if res.returncode == 0:
-            match = re.search(r"time=([\d.]+)\s*ms", res.stdout)
+            match = re.search(r"time[=<]([\d.]+)\s*ms", res.stdout, re.IGNORECASE)
             if match:
                 val = int(float(match.group(1)))
                 if val > 0:
@@ -319,12 +313,7 @@ def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
     except Exception:
         pass
 
-    # 3. Try TCP latency check
-    tcp_val = tcp_latency_ms(host, port, dev)
-    if tcp_val > 0:
-        return tcp_val
-
-    # 4. Fallback
+    # 3. 历史统计兜底
     if fallback_ping > 0:
         return fallback_ping
     return 0
@@ -389,11 +378,27 @@ def load_ip_cache() -> dict[str, dict[str, Any]]:
             pass
         return {}
 
+MAX_IP_CACHE_ENTRIES = 2000
+
 def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
     with ip_cache_lock:
         try:
             DATA_DIR.mkdir(exist_ok=True, parents=True)
-            IP_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+            now = time.time()
+            max_age = IP_CACHE_TTL_SECONDS * 2
+            pruned: dict[str, dict[str, Any]] = {
+                ip: item
+                for ip, item in cache.items()
+                if isinstance(item, dict) and (now - float(item.get("cached_at", 0) or 0)) < max_age
+            }
+            if len(pruned) > MAX_IP_CACHE_ENTRIES:
+                sorted_items = sorted(
+                    pruned.items(),
+                    key=lambda kv: float(kv[1].get("cached_at", 0) or 0),
+                    reverse=True,
+                )
+                pruned = dict(sorted_items[:MAX_IP_CACHE_ENTRIES])
+            IP_CACHE_FILE.write_text(json.dumps(pruned, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import gzip
 import json
 import os
 import queue
@@ -393,7 +394,66 @@ def purge_expired_sessions(now: float | None = None) -> int:
                 active_sessions.pop(token, None)
     return len(expired_tokens)
 
+_data_revision: int = 1
+_nodes_cache: list[dict[str, Any]] | None = None
+_nodes_cache_mtime: float = -1.0
+_nodes_cache_path: Path | None = None
+_state_cache: dict[str, Any] | None = None
+_state_cache_mtime: float = -1.0
+_state_cache_path: Path | None = None
+_ui_config_cache: dict[str, Any] | None = None
+_ui_config_cache_mtime: float = -1.0
+_ui_config_cache_path: Path | None = None
+
+def bump_data_revision() -> None:
+    global _data_revision
+    _data_revision += 1
+
+def invalidate_caches() -> None:
+    global _nodes_cache, _nodes_cache_mtime, _nodes_cache_path
+    global _state_cache, _state_cache_mtime, _state_cache_path
+    global _ui_config_cache, _ui_config_cache_mtime, _ui_config_cache_path
+    _nodes_cache = None
+    _nodes_cache_mtime = -1.0
+    _nodes_cache_path = None
+    _state_cache = None
+    _state_cache_mtime = -1.0
+    _state_cache_path = None
+    _ui_config_cache = None
+    _ui_config_cache_mtime = -1.0
+    _ui_config_cache_path = None
+
+def prune_orphaned_configs() -> int:
+    removed = 0
+    try:
+        if not CONFIG_DIR.exists():
+            return 0
+        nodes = read_nodes()
+        valid_ids = {str(n.get("id") or "") for n in nodes if n.get("id")}
+        if active_openvpn_node_id:
+            valid_ids.add(active_openvpn_node_id)
+
+        for p in CONFIG_DIR.glob("*.ovpn"):
+            if p.name.startswith(".test_"):
+                try:
+                    p.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+            else:
+                node_stem = p.stem
+                if valid_ids and node_stem not in valid_ids:
+                    try:
+                        p.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+    except Exception as exc:
+        print(f"[清理警告] 孤立配置文件清理失败: {exc}", flush=True)
+    return removed
+
 def ensure_dirs() -> None:
+    invalidate_caches()
     DATA_DIR.mkdir(exist_ok=True, parents=True)
     CONFIG_DIR.mkdir(exist_ok=True, parents=True)
     if not AUTH_FILE.exists():
@@ -402,6 +462,7 @@ def ensure_dirs() -> None:
             AUTH_FILE.chmod(0o600)
         except OSError:
             pass
+    prune_orphaned_configs()
 
 def upstream_proxy_auth_file() -> str | None:
     username, password = vpn_utils.get_upstream_proxy_auth()
@@ -420,9 +481,15 @@ def upstream_proxy_auth_file() -> str | None:
         return None
 
 def write_json(path: Path, data: Any) -> None:
+    global _nodes_cache, _nodes_cache_mtime, _nodes_cache_path
+    global _state_cache, _state_cache_mtime, _state_cache_path
     with lock:
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        if path.name == "nodes.json":
+            content = json.dumps(data, ensure_ascii=False)
+        else:
+            content = json.dumps(data, ensure_ascii=False, indent=2)
+        tmp.write_text(content, encoding="utf-8")
         if path.name == "ui_auth.json":
             try:
                 tmp.chmod(0o600)
@@ -434,6 +501,22 @@ def write_json(path: Path, data: Any) -> None:
                 path.chmod(0o600)
             except OSError:
                 pass
+
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+
+        if path.name == "nodes.json" and isinstance(data, list):
+            _nodes_cache = [dict(item) for item in data if isinstance(item, dict)]
+            _nodes_cache_mtime = mtime
+            _nodes_cache_path = path
+            bump_data_revision()
+        elif path.name == "state.json" and isinstance(data, dict):
+            _state_cache = dict(data)
+            _state_cache_mtime = mtime
+            _state_cache_path = path
+            bump_data_revision()
 
 def read_json(path: Path, default: Any) -> Any:
     with lock:
@@ -485,8 +568,17 @@ def normalize_discovery_countries(value: Any) -> list[str]:
     return normalized
 
 def load_ui_config() -> dict[str, Any]:
+    global _ui_config_cache, _ui_config_cache_mtime, _ui_config_cache_path
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
+        try:
+            mtime = auth_file.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+
+        if _ui_config_cache is not None and auth_file == _ui_config_cache_path and mtime > 0 and mtime == _ui_config_cache_mtime:
+            return dict(_ui_config_cache)
+
         config = {
             "username": "",
             "secret_path": "EJsW2EeBo9lY",
@@ -554,8 +646,14 @@ def load_ui_config() -> dict[str, Any]:
                 write_json(auth_file, config)
             except Exception:
                 pass
-                
-        return config
+
+        _ui_config_cache = dict(config)
+        _ui_config_cache_path = auth_file
+        try:
+            _ui_config_cache_mtime = auth_file.stat().st_mtime
+        except OSError:
+            _ui_config_cache_mtime = 0.0
+        return dict(config)
 
 def persist_discovery_countries(value: Any) -> list[str]:
     if not isinstance(value, list):
@@ -651,18 +749,57 @@ def log_to_json(level: str, module: str, message: str) -> None:
     except Exception as e:
         print(f"[Log Error] Failed to write JSON log: {e}", flush=True)
 
+def _update_nodes_cache_in_memory(nodes: list[dict[str, Any]]) -> None:
+    global _nodes_cache
+    _nodes_cache = [dict(item) for item in nodes if isinstance(item, dict)]
+    bump_data_revision()
+
 def set_state(**updates: Any) -> None:
-    # Keep the read-modify-write transaction atomic across background threads.
+    global _state_cache, _state_cache_mtime, _state_cache_path
     with lock:
         state = get_state()
-        state.update(updates)
-        write_json(STATE_FILE, state)
+        changed = False
+        should_persist = False
+        for k, v in updates.items():
+            if state.get(k) != v:
+                state[k] = v
+                changed = True
+                if k not in {"active_node_latency"}:
+                    should_persist = True
+
+        if changed:
+            bump_data_revision()
+            _state_cache = dict(state)
+
+        if should_persist:
+            write_json(STATE_FILE, state)
+            try:
+                _state_cache_mtime = STATE_FILE.stat().st_mtime
+                _state_cache_path = STATE_FILE
+            except OSError:
+                pass
 
 def read_nodes() -> list[dict[str, Any]]:
-    raw = read_json(NODES_FILE, [])
-    if not isinstance(raw, list):
-        return []
-    return [item for item in raw if isinstance(item, dict)]
+    global _nodes_cache, _nodes_cache_mtime, _nodes_cache_path
+    with lock:
+        try:
+            mtime = NODES_FILE.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+
+        if _nodes_cache is not None and NODES_FILE == _nodes_cache_path and mtime > 0 and mtime == _nodes_cache_mtime:
+            return [dict(item) for item in _nodes_cache]
+
+        raw = read_json(NODES_FILE, [])
+        if not isinstance(raw, list):
+            nodes = []
+        else:
+            nodes = [item for item in raw if isinstance(item, dict)]
+
+        _nodes_cache = nodes
+        _nodes_cache_mtime = mtime
+        _nodes_cache_path = NODES_FILE
+        return [dict(item) for item in nodes]
 
 # VPNGate 常见国家代码与名称映射
 COUNTRY_CODE_TO_NAMES: dict[str, tuple[str, str]] = {
@@ -773,9 +910,23 @@ def get_available_countries(nodes: list[dict[str, Any]] | None = None) -> list[d
     )
     return result
 
-def get_state() -> dict[str, Any]:
-    global active_openvpn_node_id, is_connecting
-    state = read_json(STATE_FILE, {})
+def get_state(nodes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    global active_openvpn_node_id, is_connecting, _state_cache, _state_cache_mtime, _state_cache_path
+    with lock:
+        try:
+            mtime = STATE_FILE.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+
+        if _state_cache is not None and STATE_FILE == _state_cache_path and mtime > 0 and mtime == _state_cache_mtime:
+            state = dict(_state_cache)
+        else:
+            state = read_json(STATE_FILE, {})
+            if not isinstance(state, dict):
+                state = {}
+            _state_cache = dict(state)
+            _state_cache_mtime = mtime
+            _state_cache_path = STATE_FILE
     state.pop("password", None)
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["is_connecting"] = is_connecting
@@ -814,7 +965,7 @@ def get_state() -> dict[str, Any]:
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["discovery_countries"] = normalize_discovery_countries(ui_cfg.get("discovery_countries"))
-    state["available_countries"] = get_available_countries()
+    state["available_countries"] = get_available_countries(nodes=nodes)
     state["fav_fail_fallback"] = False
     state["opencode_model"] = str(ui_cfg.get("opencode_model") or "")
     
@@ -2325,6 +2476,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
                 executor.submit(test_worker, (batch_start + idx, node)): node["id"]
                 for idx, node in enumerate(batch)
             }
+            batch_dirty = False
             for future in concurrent.futures.as_completed(futures):
                 nid = futures[future]
                 try:
@@ -2347,6 +2499,12 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
                         if current.get("id") == nid:
                             current.update(result)
                             break
+                    _update_nodes_cache_in_memory(current_nodes)
+                    batch_dirty = True
+
+            if batch_dirty:
+                with lock:
+                    current_nodes = read_nodes()
                     write_json(NODES_FILE, sort_all_nodes(current_nodes))
 
             if systemic_failure:
@@ -3884,6 +4042,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         pass
                         
             write_json(NODES_FILE, merged)
+            prune_orphaned_configs()
             ip_enrichment_wakeup.set()
 
         initial_tested_ids: set[str] = set()
@@ -7093,12 +7252,22 @@ let refreshPollInterval = null;
 let refreshPollInFlight = false;
 let connectionPollInFlight = false;
 let nodesRequestPromise = null;
+let lastNodesSnapshotEtag = "";
 
 async function fetchNodesSnapshot() {
   if (nodesRequestPromise) return nodesRequestPromise;
   const request = (async () => {
-    const response = await fetchWithTimeout("./api/nodes", { cache: "no-store" }, 20000);
+    const headers = {};
+    if (lastNodesSnapshotEtag) {
+      headers["If-None-Match"] = lastNodesSnapshotEtag;
+    }
+    const response = await fetchWithTimeout("./api/nodes", { headers, cache: "no-store" }, 20000);
+    if (response.status === 304) {
+      return null;
+    }
     if (!response.ok) throw new Error(`节点状态请求失败 (${response.status})`);
+    const etag = response.headers.get("ETag");
+    if (etag) lastNodesSnapshotEtag = etag;
     return response.json();
   })();
   nodesRequestPromise = request;
@@ -7110,6 +7279,7 @@ async function fetchNodesSnapshot() {
 }
 
 function applyNodesSnapshot(data) {
+  if (!data) return false;
   const nextNodes = Array.isArray(data && data.nodes) ? data.nodes : [];
   const nextState = data && data.state ? data.state : {};
   const signature = JSON.stringify([nextNodes, nextState]);
@@ -8322,6 +8492,9 @@ def background_proxy_checker() -> None:
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
         time.sleep(30)
 
+def get_nodes_snapshot_etag() -> str:
+    return f'"{_data_revision}-{active_openvpn_node_id}-{int(is_connecting)}-{last_active_latency}"'
+
 def active_node_pinger() -> None:
     global last_pinger_heartbeat
     while True:
@@ -8494,19 +8667,56 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
 
-    def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def send_bytes(
+        self,
+        body: bytes,
+        content_type: str,
+        status: HTTPStatus = HTTPStatus.OK,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        can_gzip = (
+            len(body) >= 512
+            and not content_type.startswith("image/")
+            and not content_type.startswith("application/zip")
+            and "gzip" in str(getattr(self, "headers", None).get("Accept-Encoding", "") if getattr(self, "headers", None) else "").lower()
+        )
+        content_encoding = None
+        if can_gzip:
+            compressed = gzip.compress(body)
+            if len(compressed) < len(body):
+                body = compressed
+                content_encoding = "gzip"
+
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        if content_encoding:
+            self.send_header("Content-Encoding", content_encoding)
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        cache_control = extra_headers.get("Cache-Control", "no-store") if extra_headers else "no-store"
+        self.send_header("Cache-Control", cache_control)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                if k not in ("Cache-Control",):
+                    self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
-    def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
-        self.send_bytes(json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
+    def send_json(
+        self,
+        data: Any,
+        status: HTTPStatus = HTTPStatus.OK,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        self.send_bytes(
+            json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            "application/json; charset=utf-8",
+            status,
+            extra_headers=extra_headers,
+        )
 
     def read_request_body(self, max_bytes: int = 65536) -> bytes:
         length = parse_int(self.headers.get("Content-Length"))
@@ -8540,9 +8750,18 @@ class Handler(BaseHTTPRequestHandler):
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
+            client_etag = self.headers.get("If-None-Match", "").strip() if getattr(self, "headers", None) else ""
+            current_etag = get_nodes_snapshot_etag()
+            if client_etag and client_etag == current_etag:
+                self.send_response(HTTPStatus.NOT_MODIFIED)
+                self.send_header("ETag", current_etag)
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                return
+
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_nodes()
-            connection_state = get_state()
+            connection_state = get_state(nodes=nodes)
             connection_ready = connection_ready_for_ui(connection_state)
             active_node = next((n for n in nodes if connection_ready and n.get("id") == active_openvpn_node_id), None)
             for n in nodes:
@@ -8574,7 +8793,10 @@ class Handler(BaseHTTPRequestHandler):
                 if "config_text" in stripped:
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
-            self.send_json({"nodes": stripped_nodes, "state": get_state()})
+            self.send_json(
+                {"nodes": stripped_nodes, "state": connection_state},
+                extra_headers={"ETag": current_etag, "Cache-Control": "no-cache"},
+            )
         elif effective_path == "/api/opencode_models":
             try:
                 models = fetch_opencode_models()

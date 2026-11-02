@@ -1705,5 +1705,101 @@ class ProxyServerConcurrencyTests(unittest.TestCase):
         self.assertEqual([("first", "first"), ("second", "second")], seen)
 
 
+    def test_set_state_dirty_checking_and_latency_exemption(self) -> None:
+        manager.set_state(proxy_ok=True, proxy_ip="1.2.3.4")
+        mtime_initial = manager.STATE_FILE.stat().st_mtime
+
+        # Calling set_state with identical values must not rewrite the file
+        manager.set_state(proxy_ok=True, proxy_ip="1.2.3.4")
+        self.assertEqual(mtime_initial, manager.STATE_FILE.stat().st_mtime)
+
+        # Updating ephemeral active_node_latency must reflect in get_state without waking disk
+        manager.set_state(active_node_latency="42 ms")
+        self.assertEqual("42 ms", manager.get_state().get("active_node_latency"))
+        self.assertEqual(mtime_initial, manager.STATE_FILE.stat().st_mtime)
+
+    def test_read_nodes_in_memory_caching(self) -> None:
+        manager.write_json(manager.NODES_FILE, [{"id": "node1", "ip": "1.1.1.1"}])
+        first_read = manager.read_nodes()
+        self.assertEqual(1, len(first_read))
+
+        # Modifying returned dict must not corrupt in-memory cache
+        first_read[0]["ip"] = "modified"
+        second_read = manager.read_nodes()
+        self.assertEqual("1.1.1.1", second_read[0]["ip"])
+
+    def test_prune_orphaned_configs(self) -> None:
+        manager.CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        valid_cfg = manager.CONFIG_DIR / "valid_node.ovpn"
+        orphan_cfg = manager.CONFIG_DIR / "orphan_node.ovpn"
+        test_tmp = manager.CONFIG_DIR / ".test_temp_123.ovpn"
+
+        valid_cfg.write_text("client\n", encoding="utf-8")
+        orphan_cfg.write_text("client\n", encoding="utf-8")
+        test_tmp.write_text("client\n", encoding="utf-8")
+
+        manager.write_json(manager.NODES_FILE, [{"id": "valid_node", "ip": "1.1.1.1"}])
+        removed = manager.prune_orphaned_configs()
+
+        self.assertTrue(valid_cfg.exists())
+        self.assertFalse(orphan_cfg.exists())
+        self.assertFalse(test_tmp.exists())
+        self.assertEqual(2, removed)
+
+    def test_api_nodes_etag_and_gzip_support(self) -> None:
+        manager.write_json(manager.NODES_FILE, [{"id": "test_node", "ip": "2.2.2.2"}])
+        current_etag = manager.get_nodes_snapshot_etag()
+
+        handler = manager.Handler.__new__(manager.Handler)
+        handler.client_address = ("127.0.0.1", 54321)
+        handler.path = "/EJsW2EeBo9lY/api/nodes"
+        handler.is_authorized = lambda: True
+
+        sent_status = []
+        sent_headers = {}
+        sent_bytes_payload = []
+
+        def mock_send_response(code):
+            sent_status.append(code)
+        def mock_send_header(k, v):
+            sent_headers[k] = v
+        def mock_send_bytes(body, ctype, status=200, extra_headers=None):
+            sent_status.append(status)
+            sent_bytes_payload.append(body)
+
+        handler.send_response = mock_send_response
+        handler.send_header = mock_send_header
+        handler.end_headers = lambda: None
+        handler.send_bytes = mock_send_bytes
+        handler.wfile = mock.Mock()
+
+        # Conditional request with matching If-None-Match receives 304
+        handler.headers = {"If-None-Match": current_etag}
+        manager.Handler.do_GET(handler)
+        self.assertIn(304, sent_status)
+
+        # Transparent Gzip support check in send_bytes
+        sent_status.clear()
+        sent_headers.clear()
+        large_json = json.dumps({"nodes": [{"id": f"node_{i}", "data": "x" * 100} for i in range(20)]}).encode("utf-8")
+        handler.headers = {"Accept-Encoding": "gzip, deflate"}
+        handler.wfile = mock.Mock()
+        manager.Handler.send_bytes(handler, large_json, "application/json")
+        self.assertEqual("gzip", sent_headers.get("Content-Encoding"))
+        self.assertEqual(200, sent_status[0])
+
+    def test_save_ip_cache_pruning(self) -> None:
+        now = time.time()
+        # Entry 1: fresh (2 days old)
+        # Entry 2: expired (20 days old)
+        cache_data = {
+            "1.1.1.1": {"cached_at": now - 2 * 86400, "isp": "Fresh ISP"},
+            "2.2.2.2": {"cached_at": now - 20 * 86400, "isp": "Expired ISP"},
+        }
+        manager.vpn_utils.save_ip_cache(cache_data)
+        loaded = manager.vpn_utils.load_ip_cache()
+        self.assertIn("1.1.1.1", loaded)
+        self.assertNotIn("2.2.2.2", loaded)
+
 if __name__ == "__main__":
     unittest.main()
