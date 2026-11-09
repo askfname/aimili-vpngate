@@ -135,7 +135,11 @@ OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", os.environ.get("OPENCODE_Z
 OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "").strip()
 OPENCODE_FALLBACK_MODEL = os.environ.get("OPENCODE_FALLBACK_MODEL", "beam-free").strip() or "beam-free"
 OPENCODE_EXTRA_HEADERS = os.environ.get("OPENCODE_EXTRA_HEADERS", "").strip()
-OPENCODE_CHECK_PROMPT = os.environ.get("OPENCODE_CHECK_PROMPT", "Reply with the single word OK.").strip() or "Reply with the single word OK."
+# 仅当用户显式设置 OPENCODE_CHECK_PROMPT 时才固定检测提示词；默认让探针
+# 从提示词池随机选取，避免固定文本指纹被网关封杀。
+OPENCODE_CHECK_PROMPT = os.environ.get("OPENCODE_CHECK_PROMPT", "").strip()
+OPENCODE_CHECK_PROMPT_IS_CUSTOM = bool(OPENCODE_CHECK_PROMPT)
+OPENCODE_CHECK_PROMPT = OPENCODE_CHECK_PROMPT or "Reply with the single word OK."
 OPENCODE_CLIENT_VERSION_TTL_SECONDS = 6 * 3600
 OPENCODE_CHECK_WORKERS = env_int("OPENCODE_CHECK_WORKERS", 10, 1, 24)
 OPENCODE_CHECK_TIMEOUT_SECONDS = env_int("OPENCODE_CHECK_TIMEOUT_SECONDS", 20, 5, 90)
@@ -143,6 +147,8 @@ OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS = env_int("OPENCODE_CHECK_CONNECT_TIMEOUT
 OPENCODE_OPENVPN_TIMEOUT_SECONDS = env_int("OPENCODE_OPENVPN_TIMEOUT_SECONDS", 12, 5, 60)
 OPENCODE_CHECK_NODE_LIMIT = env_int("OPENCODE_CHECK_NODE_LIMIT", 2000, 1, 10000)
 OPENCODE_RESULT_FLUSH_SECONDS = 0.8
+# 429 额度用尽的重置窗口内默认跳过重复检测（重置前结果不可能变化）
+OPENCODE_CHECK_SKIP_LIMITED = os.environ.get("OPENCODE_CHECK_SKIP_LIMITED", "1").strip().lower() not in ("0", "false", "no", "off")
 OPENCODE_MARK_BASE = 0x4F430000
 OPENCODE_TABLE_BASE = 1000
 OPENCODE_RULE_PRIORITY_BASE = 19000
@@ -261,10 +267,6 @@ def opencode_client_version() -> str:
         _opencode_client_version_at = now
         return _opencode_client_version or fallback
 
-def opencode_session_id() -> str:
-    suffix = re.sub(r"[^A-Za-z0-9]", "", secrets.token_urlsafe(24))[:14].ljust(14, "x")
-    return f"ses_{secrets.token_hex(6)}{suffix}"
-
 def opencode_extra_headers() -> dict[str, str]:
     if not OPENCODE_EXTRA_HEADERS:
         return {}
@@ -282,22 +284,14 @@ def opencode_extra_headers() -> dict[str, str]:
             headers[name] = text
     return headers
 
-def build_opencode_headers(host: str, accept: str) -> dict[str, str]:
-    session_id = opencode_session_id()
+def build_opencode_headers() -> dict[str, str]:
+    # 与真实客户端拉取模型列表一致：仅 Authorization / User-Agent / x-opencode-client
+    # 三个头（真实 OpenCode 的 GET /models 不携带会话头、缓存头等附加头）。
     api_key = re.sub(r"[\r\n]+", "", OPENCODE_API_KEY)
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": accept,
-        "Accept-Encoding": "identity",
-        "Cache-Control": "no-cache",
         "User-Agent": f"opencode/latest/{opencode_client_version()}/cli",
         "x-opencode-client": "cli",
-        "x-session-id": session_id,
-        "x-opencode-session": session_id,
-        "x-opencode-session-id": session_id,
-        "x-session-affinity": session_id,
-        "x-opencode-request": uuid.uuid4().hex,
     }
     if not api_key:
         headers.pop("Authorization", None)
@@ -2610,7 +2604,7 @@ def parse_opencode_models(text: str) -> list[str]:
 
 def fetch_opencode_models() -> list[str]:
     """直连获取 OpenCode 免费模型列表（模型列表接口可用普通 HTTP 栈，无需节点隧道）。"""
-    headers = build_opencode_headers(urllib.parse.urlsplit(OPENCODE_MODELS_URL).hostname or "", "application/json")
+    headers = build_opencode_headers()
     request = urllib.request.Request(OPENCODE_MODELS_URL, headers=headers, method="GET")
     with urllib.request.urlopen(request, timeout=OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS) as response:
         raw = response.read(2 * 1024 * 1024)
@@ -2673,18 +2667,51 @@ def opencode_failure_kind(status_code: int, message: str) -> str:
         return "limited"
     return "failed"
 
+def next_utc_midnight(now: float | None = None) -> float:
+    """Zen 免费额度按 UTC 自然日重置：返回下一个 UTC 午夜的 epoch 时间。"""
+    moment = time.time() if now is None else now
+    return (moment // 86400) * 86400 + 86400
+
 # ===== Bun 探针基础设施 =====
 # 网关按 HTTP/TLS 栈指纹判定请求形状，纯 Python 原始 socket 检测会被误判为
 # "额度用尽"（429 FreeUsageLimitError），因此统一经由 Bun 运行时发请求。
 
 BUN_PROBE_SCRIPT = r"""// OpenCode 免费额度探针：只允许经 Bun 运行时运行，复刻真实 CLI 的请求形状。
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 const ALPHABET62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const DEFAULT_ENDPOINT = "https://opencode.ai/inference/openai/v1/chat/completions";
-const TEMP_HINT = "  Prefer /tmp/opencode over generic system temporary directories such as /tmp; it is pre-created and approved for external access.";
+// 与真实客户端一致：系统提示词为完整 agent 指令，环境块追加在其后（真实
+// OpenCode 从不发送仅含环境块的系统消息，纯环境块是易被封杀的固定指纹）。
+const SYSTEM_PREAMBLE = [
+  "You are an AI agent running in OpenCode, a coding agent harness. Help the user accomplish their goals using the tools you have available.",
+  "",
+  "# Harness",
+  "- Responses are rendered as GitHub-flavored Markdown.",
+  "- Prefer parallelizing independent tool calls.",
+  "- Prefer dedicated tools over shell commands when possible.",
+  "",
+  "# Communication",
+  "- Use clear file paths when referring to files.",
+  "- Keep responses clear and concise, and avoid unnecessary technical jargon.",
+  "",
+  "# Working in codebases",
+  "- Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.",
+  "- Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.",
+].join("\n");
+// 用户消息从真实风格的问题池随机选取：固定文本指纹（同一字面提示词从大量
+// IP 并发出现）此前已被 Zen 逐个封杀，随机化可避免成为下一个目标。
+const PROMPT_POOL = [
+  "Quick check: in one short sentence, what does a reverse proxy do?",
+  "Sanity check: reply with one sentence on why CI pipelines cache dependencies.",
+  "Quick check: in one sentence, when should you rebase a feature branch?",
+  "Sanity check: give a one-sentence difference between TCP and UDP.",
+  "Quick check: in one sentence, what does a database index trade off?",
+  "Sanity check: reply with one sentence on what a lock file is for.",
+];
 const TOOL_DESCRIPTION = "Not available. Never call this tool.";
 const TOOL_PARAMETER = { edit: "path", glob: "pattern", grep: "pattern", read: "path", shell: "command" };
 
@@ -2692,16 +2719,18 @@ const started = Date.now();
 const model = process.argv[2] || "";
 const endpoint = process.env.OPENCODE_PROBE_URL || DEFAULT_ENDPOINT;
 const clientVersion = process.env.OPENCODE_PROBE_UA_VERSION || "2.2.5";
-const prompt = process.env.OPENCODE_PROBE_PROMPT || "Reply with the single word OK.";
+const customPrompt = (process.env.OPENCODE_PROBE_PROMPT || "").trim();
+const prompt = customPrompt || PROMPT_POOL[Math.floor(Math.random() * PROMPT_POOL.length)];
 const apiKey = process.env.OPENCODE_PROBE_API_KEY || "public";
 const timeoutSeconds = Number(process.env.OPENCODE_PROBE_TIMEOUT || "20") || 20;
 
-function emit(status, content, message) {
+function emit(status, content, message, retryAfter) {
   console.log("PROBE:" + JSON.stringify({
     status: status || 0,
     content: content || "",
     message: String(message || "").slice(0, 400),
     latency: Math.max(0, Date.now() - started),
+    retry_after: Math.max(0, Number(retryAfter) || 0),
   }));
 }
 
@@ -2758,15 +2787,85 @@ function extractErrorMessage(payload) {
   return "";
 }
 
+// 与真实客户端一致：向上查找最近的 .git（而非仅检查 cwd），工作区根目录取
+// 仓库根，项目 ID 优先取 git-remote 形态（packages/core/src/project.ts 的行为）。
+function remotePath(value) {
+  const input = String(value || "").trim();
+  if (!input) return undefined;
+  const parts = (host, name) => {
+    const path = name.replace(/^\/+/, "").replace(/\.git\/?$/, "").replace(/\/+$/, "");
+    return host && path ? `${host.toLowerCase()}/${path}` : undefined;
+  };
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) {
+    try {
+      const url = new URL(input);
+      return url.protocol === "file:" ? undefined : parts(url.hostname, url.pathname);
+    } catch {
+      return undefined;
+    }
+  }
+  const scp = /^([^@/:]+@)?([^/:]+):(.+)$/.exec(input);
+  return scp ? parts(scp[2], scp[3]) : undefined;
+}
+
+function repository(dir) {
+  for (;;) {
+    const dotGit = join(dir, ".git");
+    let stat;
+    try {
+      stat = statSync(dotGit);
+    } catch {}
+    if (stat) {
+      try {
+        let common = dotGit;
+        if (stat.isFile()) {
+          const gitdir = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim();
+          if (!gitdir) return { root: dir, remote: undefined };
+          const own = resolve(dir, gitdir);
+          let shared = own;
+          try {
+            shared = resolve(own, readFileSync(join(own, "commondir"), "utf8").trim());
+          } catch {}
+          common = shared;
+        }
+        const config = readFileSync(join(common, "config"), "utf8");
+        const remotes = [...config.matchAll(/^\s*\[remote\s+"([^"]+)"\]([^[]*)/gm)].map((m) => ({
+          name: m[1],
+          url: /^\s*url\s*=\s*(.+)$/m.exec(m[2])?.[1],
+        }));
+        const remote = remotes.find((r) => r.name === "origin") ?? remotes[0];
+        return { root: dir, remote: remote?.url && remotePath(remote.url) };
+      } catch {
+        return { root: dir, remote: undefined };
+      }
+    }
+    const up = dirname(dir);
+    if (up === dir) return undefined;
+    dir = up;
+  }
+}
+
+// OpenCode 自己的临时目录提示：系统临时目录按真实路径解析后拼接 opencode。
+function opencodeTmp() {
+  try {
+    return join(realpathSync(tmpdir()), "opencode");
+  } catch {
+    return join(tmpdir(), "opencode");
+  }
+}
+
 async function main() {
   if (!model) {
-    emit(0, "", "missing model argument");
+    emit(0, "", "missing model argument", 0);
     return;
   }
   const cwd = process.cwd();
-  const isGitRepo = existsSync(join(cwd, ".git"));
+  const repo = repository(cwd);
+  const isGitRepo = Boolean(repo);
   const session = opencodeID("ses", true);
-  const project = createHash("sha1").update(`directory:${cwd}`).digest("hex");
+  const project = repo?.remote
+    ? createHash("sha1").update(`git-remote:${repo.remote}`).digest("hex")
+    : createHash("sha1").update(`directory:${repo?.root ?? cwd}`).digest("hex");
   const trace = randomBytes(16).toString("hex");
   const span = randomBytes(8).toString("hex");
   const hex = (length) => randomBytes(length).toString("hex");
@@ -2776,10 +2875,10 @@ async function main() {
     "Here is some useful information about the environment you are running in:",
     "<env>",
     `  Working directory: ${cwd}`,
-    `  Workspace root folder: ${cwd}`,
+    `  Workspace root folder: ${repo && repo.root !== cwd ? repo.root : cwd}`,
     `  Is directory a git repo: ${isGitRepo ? "yes" : "no"}`,
     `  Platform: ${process.platform}`,
-    TEMP_HINT,
+    `  Prefer ${opencodeTmp()} over generic system temporary directories such as /tmp; it is pre-created and approved for external access.`,
     "</env>",
   ].join("\n");
 
@@ -2799,9 +2898,11 @@ async function main() {
   const body = {
     model,
     messages: [
-      { role: "system", content: envBlock },
+      { role: "system", content: `${SYSTEM_PREAMBLE}\n\n${envBlock}` },
       { role: "user", content: prompt },
     ],
+    // 真实 CLI 始终携带 max_tokens（由模型上限推导），缺失是探针特征
+    max_tokens: 64,
     stream: true,
     stream_options: { include_usage: true },
     tools,
@@ -2832,7 +2933,8 @@ async function main() {
     let message = "";
     try { message = extractErrorMessage(JSON.parse(text)); } catch {}
     if (!message) message = text.trim().slice(0, 200) || `HTTP ${response.status}`;
-    emit(response.status, "", message);
+    // 429 携带 retry-after：距额度重置（UTC 00:00）的秒数
+    emit(response.status, "", message, response.headers.get("retry-after"));
     return;
   }
 
@@ -2841,8 +2943,8 @@ async function main() {
   let buffer = "";
   let content = "";
   let message = "";
-  let shouldStop = false;
-  while (!shouldStop) {
+  // 与真实客户端一致：完整读取流（而非收到首个分片即中断）
+  while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
@@ -2856,23 +2958,22 @@ async function main() {
       let payload;
       try { payload = JSON.parse(raw); } catch { continue; }
       const errorMessage = extractErrorMessage(payload);
-      if (errorMessage) { message = errorMessage; shouldStop = true; break; }
+      if (errorMessage) { message = errorMessage; break; }
       const piece = extractContent(payload);
-      if (piece.trim()) { content += piece; shouldStop = true; break; }
-      const choice = payload.choices && payload.choices[0];
-      if (typeof choice === "object" && choice && choice.finish_reason) { shouldStop = true; break; }
+      if (piece) content += piece;
     }
+    if (message) break;
   }
-  emit(response.status, content, message);
+  emit(response.status, content, message, response.headers.get("retry-after"));
 }
 
 main().catch((error) => {
   const name = error && error.name || "";
   const text = error && error.message || String(error);
   if (name === "AbortError" || name === "TimeoutError") {
-    emit(0, "", `request timeout after ${timeoutSeconds}s`);
+    emit(0, "", `request timeout after ${timeoutSeconds}s`, 0);
   } else {
-    emit(0, "", text);
+    emit(0, "", text, 0);
   }
 });
 """
@@ -3093,7 +3194,9 @@ def opencode_spawn_probe(
     env.pop("NO_PROXY", None)
     env.pop("no_proxy", None)
     env["OPENCODE_PROBE_URL"] = OPENCODE_API_URL
-    env["OPENCODE_PROBE_PROMPT"] = OPENCODE_CHECK_PROMPT
+    # 仅在用户显式指定提示词时传递，默认由探针从提示词池随机选取
+    if OPENCODE_CHECK_PROMPT_IS_CUSTOM:
+        env["OPENCODE_PROBE_PROMPT"] = OPENCODE_CHECK_PROMPT
     env["OPENCODE_PROBE_TIMEOUT"] = str(OPENCODE_CHECK_TIMEOUT_SECONDS)
     env["OPENCODE_PROBE_UA_VERSION"] = opencode_client_version()
     env["OPENCODE_PROBE_API_KEY"] = OPENCODE_API_KEY or "public"
@@ -3138,7 +3241,7 @@ def opencode_wait_probe(
 
 def opencode_parse_probe_output(raw: str) -> dict[str, Any]:
     """解析探针输出的 PROBE: JSON 行；无结构化输出时给出诊断文本。"""
-    result: dict[str, Any] = {"structured": False, "status": 0, "content": "", "message": "", "latency": 0}
+    result: dict[str, Any] = {"structured": False, "status": 0, "content": "", "message": "", "latency": 0, "retry_after": 0}
     for line in raw.splitlines():
         text = line.strip()
         if not text.startswith("PROBE:"):
@@ -3154,6 +3257,7 @@ def opencode_parse_probe_output(raw: str) -> dict[str, Any]:
                 "content": str(parsed.get("content") or ""),
                 "message": str(parsed.get("message") or ""),
                 "latency": int(parsed.get("latency") or 0),
+                "retry_after": int(parsed.get("retry_after") or 0),
             }
     if not result.get("structured"):
         tail = [line.strip() for line in raw.splitlines() if line.strip()]
@@ -3181,8 +3285,8 @@ def opencode_probe_fetch(
     model: str,
     mark: int,
     cancel_event: threading.Event,
-) -> tuple[str, str, int]:
-    """经本地代理 + Bun 运行时请求 OpenCode，返回 (状态, 消息, 延迟ms)。"""
+) -> tuple[str, str, int, float]:
+    """经本地代理 + Bun 运行时请求 OpenCode，返回 (状态, 消息, 延迟ms, 额度重置时间)。"""
     started = time.time()
 
     def measured_latency() -> int:
@@ -3190,25 +3294,25 @@ def opencode_probe_fetch(
 
     bun_path = find_bun_executable()
     if not bun_path:
-        return "failed", "未找到 Bun 运行时，OpenCode 检测必须经由 Bun 请求", measured_latency()
+        return "failed", "未找到 Bun 运行时，OpenCode 检测必须经由 Bun 请求", measured_latency(), 0.0
     if cancel_event.is_set():
-        return "failed", "检测已取消", measured_latency()
+        return "failed", "检测已取消", measured_latency(), 0.0
     try:
         script_path = ensure_opencode_probe_script()
     except OSError as exc:
-        return "failed", f"无法写入 OpenCode 探针脚本: {exc}", measured_latency()
+        return "failed", f"无法写入 OpenCode 探针脚本: {exc}", measured_latency(), 0.0
 
     proxy: OpencodeLocalProxy | None = None
     process: subprocess.Popen[str] | None = None
     try:
         proxy = OpencodeLocalProxy(target, mark, cancel_event)
     except OSError as exc:
-        return "failed", f"无法启动本地检测代理: {exc}", measured_latency()
+        return "failed", f"无法启动本地检测代理: {exc}", measured_latency(), 0.0
     try:
         try:
             process = opencode_spawn_probe(bun_path, script_path, model, proxy.port)
         except RuntimeError as exc:
-            return "failed", str(exc), measured_latency()
+            return "failed", str(exc), measured_latency(), 0.0
         stdout_text, interrupted = opencode_wait_probe(
             process,
             started + OPENCODE_CHECK_TIMEOUT_SECONDS,
@@ -3226,8 +3330,14 @@ def opencode_probe_fetch(
             message = proxy.last_error or str(result.get("message") or "Bun 探针没有输出结果")
         latency_ms = int(result.get("latency") or 0) or measured_latency()
         if status != "available" and cancel_event.is_set():
-            return "failed", "检测已取消", latency_ms
-        return status, opencode_short_text(message), latency_ms
+            return "failed", "检测已取消", latency_ms, 0.0
+        # 429 表示该 IP 当日免费额度已耗尽：记录重置时间（UTC 00:00），
+        # 供跳过重置前的重复检测并在界面上提示。
+        reset_at = 0.0
+        if status == "limited" and int(result.get("status") or 0) == 429:
+            reset_at = time.time() + int(result.get("retry_after") or 0) if int(result.get("retry_after") or 0) > 0 else next_utc_midnight()
+            message = f"{opencode_short_text(message, 90)}（IP 每日额度，{time.strftime('%H:%M', time.gmtime(reset_at))} UTC 重置）"
+        return status, opencode_short_text(message), latency_ms, reset_at
     finally:
         if process is not None:
             stop_process(process)
@@ -3336,6 +3446,7 @@ def opencode_probe_node(
         "opencode_model": model,
         "opencode_latency_ms": 0,
         "opencode_checked_at": time.time(),
+        "opencode_reset_at": 0.0,
     }
     if cancel_event.is_set():
         return result
@@ -3376,7 +3487,7 @@ def opencode_probe_node(
             return result
         route_ready = True
         mark, _, _ = opencode_route_params(test_index)
-        status, message, latency_ms = opencode_probe_fetch(target, model, mark, cancel_event)
+        status, message, latency_ms, reset_at = opencode_probe_fetch(target, model, mark, cancel_event)
         if cancel_event.is_set() and status != "available":
             return result
         result.update(
@@ -3384,6 +3495,7 @@ def opencode_probe_node(
             opencode_message=opencode_short_text(message),
             opencode_latency_ms=latency_ms,
             opencode_checked_at=time.time(),
+            opencode_reset_at=reset_at,
         )
         return result
     except Exception as exc:
@@ -3417,7 +3529,7 @@ def flush_opencode_results(pending: dict[str, dict[str, Any]], reset_checking_id
                 node["opencode_message"] = "检测已取消"
         write_json(NODES_FILE, sort_all_nodes(nodes))
 
-def _run_opencode_check(node_ids: list[str], requested_model: str = "") -> None:
+def _run_opencode_check(node_ids: list[str], requested_model: str = "", force: bool = False) -> None:
     global opencode_check_thread
     cancel_event = opencode_check_cancel_event
     counters = {"available": 0, "limited": 0, "failed": 0, "done": 0}
@@ -3440,18 +3552,49 @@ def _run_opencode_check(node_ids: list[str], requested_model: str = "") -> None:
             )
             return
         update_opencode_check_stats(model=model, message="正在建立并发测试隧道...")
+        now = time.time()
+        skip_limited = OPENCODE_CHECK_SKIP_LIMITED and not force
+        skipped: dict[str, dict[str, Any]] = {}
         with lock:
             wanted = set(node_ids)
             nodes = read_nodes()
             selected = [node for node in nodes if str(node.get("id") or "") in wanted]
+            probe_nodes: list[dict[str, Any]] = []
             for node in selected:
+                node_id = str(node.get("id") or "")
+                reset_at = float(node.get("opencode_reset_at") or 0)
+                if skip_limited and node.get("opencode_status") == "limited" and reset_at > now:
+                    # 429 重置窗口内：跳过重复请求（也省去建隧道的时间）
+                    skipped[node_id] = {
+                        "id": node_id,
+                        "opencode_status": "limited",
+                        "opencode_message": opencode_short_text(
+                            f"{node.get('opencode_message') or '额度用尽'}（重置前跳过重复检测）"
+                        ),
+                        "opencode_model": str(node.get("opencode_model") or model),
+                        "opencode_latency_ms": parse_int(node.get("opencode_latency_ms")),
+                        "opencode_checked_at": now,
+                        "opencode_reset_at": reset_at,
+                    }
+                    continue
                 node["opencode_status"] = "checking"
                 node["opencode_message"] = "正在通过节点请求 OpenCode..."
                 node["opencode_model"] = model
                 node["opencode_latency_ms"] = 0
                 node["opencode_checked_at"] = 0
+                node["opencode_reset_at"] = 0.0
+                probe_nodes.append(node)
             write_json(NODES_FILE, sort_all_nodes(nodes))
-        update_opencode_check_stats(total=len(selected), message="正在并发检测 OpenCode 免费模型...")
+        if skipped:
+            counters["done"] += len(skipped)
+            counters["limited"] += len(skipped)
+            pending.update(skipped)
+        update_opencode_check_stats(
+            total=len(selected),
+            done=counters["done"],
+            limited=counters["limited"],
+            message="正在并发检测 OpenCode 免费模型...",
+        )
         if not selected:
             update_opencode_check_stats(
                 running=False,
@@ -3459,13 +3602,22 @@ def _run_opencode_check(node_ids: list[str], requested_model: str = "") -> None:
                 finished_at=time.time(),
             )
             return
+        if not probe_nodes:
+            flush_opencode_results(pending)
+            pending.clear()
+            update_opencode_check_stats(
+                running=False,
+                message=f"检测完成：{len(skipped)} 个节点额度用尽（重置窗口内跳过重复请求）",
+                finished_at=time.time(),
+            )
+            return
 
-        worker_count = min(OPENCODE_CHECK_WORKERS, len(selected))
+        worker_count = min(OPENCODE_CHECK_WORKERS, len(probe_nodes))
         futures_cancelled = False
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
                 executor.submit(opencode_probe_node, node, target, model, cancel_event): str(node.get("id") or "")
-                for node in selected
+                for node in probe_nodes
             }
             for future in concurrent.futures.as_completed(futures):
                 node_id = futures[future]
@@ -3514,14 +3666,16 @@ def _run_opencode_check(node_ids: list[str], requested_model: str = "") -> None:
         available = counters["available"]
         limited = counters["limited"]
         failed = counters["failed"]
+        # 免费额度按节点 IP 每日重置：额度用尽不是封禁，重置后会自动恢复
+        quota_note = f" · 免费额度按 IP 每日重置（UTC 00:00）" if limited else ""
         if systemic_message:
             message = f"检测中止：{systemic_message}"
         elif cancelled:
-            message = f"检测已停止：可用 {available} · 额度用尽 {limited} · 不可用 {failed}"
+            message = f"检测已停止：可用 {available} · 额度用尽 {limited} · 不可用 {failed}{quota_note}"
         elif available:
-            message = f"检测完成：可用 {available} · 额度用尽 {limited} · 不可用 {failed} · 模型 {model}"
+            message = f"检测完成：可用 {available} · 额度用尽 {limited} · 不可用 {failed} · 模型 {model}{quota_note}"
         else:
-            message = f"检测完成：未发现可用节点 · 额度用尽 {limited} · 不可用 {failed} · 模型 {model}"
+            message = f"检测完成：未发现可用节点 · 额度用尽 {limited} · 不可用 {failed} · 模型 {model}{quota_note}"
         print(f"[OpenCode] {message}", flush=True)
         log_to_json("INFO" if available else "WARNING", "OpenCode", message)
         update_opencode_check_stats(
@@ -3551,7 +3705,7 @@ def _run_opencode_check(node_ids: list[str], requested_model: str = "") -> None:
         except RuntimeError:
             pass
 
-def start_opencode_check(node_ids: list[str], model: str = "") -> dict[str, Any]:
+def start_opencode_check(node_ids: list[str], model: str = "", force: bool = False) -> dict[str, Any]:
     global opencode_check_thread
     unique_ids = list(dict.fromkeys(str(node_id or "").strip() for node_id in node_ids if str(node_id or "").strip()))
     if not unique_ids:
@@ -3581,7 +3735,11 @@ def start_opencode_check(node_ids: list[str], model: str = "") -> dict[str, Any]
             finished_at=0.0,
             cancelled=False,
         )
-        thread = threading.Thread(target=_run_opencode_check, args=(unique_ids, str(model or "").strip()), daemon=True)
+        thread = threading.Thread(
+            target=_run_opencode_check,
+            args=(unique_ids, str(model or "").strip(), bool(force)),
+            daemon=True,
+        )
         opencode_check_thread = thread
         thread.start()
         return opencode_check_snapshot()
@@ -4024,6 +4182,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             "opencode_model",
                             "opencode_latency_ms",
                             "opencode_checked_at",
+                            "opencode_reset_at",
                         ]:
                             if previous.get(key) not in (None, ""):
                                 cand[key] = previous.get(key)
@@ -6978,6 +7137,11 @@ function opencodeBadgeHtml(n){
     if (n.opencode_message) titleParts.push(n.opencode_message);
     if (n.opencode_model) titleParts.push(`模型 ${n.opencode_model}`);
     if (latency > 0) titleParts.push(`${latency} ms`);
+    // 额度用尽且未到重置时间：提示这是每日额度而非封禁
+    const resetAt = Number(n.opencode_reset_at || 0);
+    if (status === "limited" && resetAt > Date.now() / 1000) {
+      titleParts.push(`每日额度，${new Date(resetAt * 1000).toISOString().substring(11, 16)} UTC 重置`);
+    }
     if (checkedAt > 0) titleParts.push(new Date(checkedAt * 1000).toLocaleString());
   } else {
     titleParts.push("点击工具栏“检测 OpenCode”检查该节点的免费额度");
@@ -9609,7 +9773,9 @@ class Handler(BaseHTTPRequestHandler):
                 if len(node_ids) > OPENCODE_CHECK_NODE_LIMIT:
                     raise ValueError(f"单次最多检测 {OPENCODE_CHECK_NODE_LIMIT} 个节点")
                 model = str(payload.get("model") or "").strip()
-                self.send_json({"ok": True, "opencode_check": start_opencode_check(node_ids, model=model)})
+                # force=true 时忽略“额度用尽未重置”的跳过逻辑，强制重新请求
+                force = payload.get("force") is True
+                self.send_json({"ok": True, "opencode_check": start_opencode_check(node_ids, model=model, force=force)})
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except RuntimeError as exc:

@@ -901,9 +901,10 @@ class ManagerLogicTests(unittest.TestCase):
 
     def test_opencode_probe_output_parsing_and_classification(self) -> None:
         result = manager.opencode_parse_probe_output(
-            'PROBE: {"status": 429, "content": "", "message": "Free usage limit reached.", "latency": 55}'
+            'PROBE: {"status": 429, "content": "", "message": "Free usage limit reached.", "latency": 55, "retry_after": 47472}'
         )
         self.assertTrue(result.get("structured"))
+        self.assertEqual(47472, result.get("retry_after"))
         status, message = manager.opencode_probe_result_status(result)
         self.assertEqual("limited", status)
         self.assertIn("Free usage limit", message)
@@ -916,6 +917,11 @@ class ManagerLogicTests(unittest.TestCase):
         fallback = manager.opencode_parse_probe_output("bun: 1 | ERROR boom")
         self.assertFalse(fallback.get("structured"))
         self.assertEqual("bun: 1 | ERROR boom", fallback.get("message"))
+        self.assertEqual(0, fallback.get("retry_after"))
+
+    def test_next_utc_midnight_aligns_with_day_boundary(self) -> None:
+        self.assertEqual(0, manager.next_utc_midnight(86400 * 10) % 86400)
+        self.assertEqual(86400 * 11, manager.next_utc_midnight(86400 * 10 + 3600))
 
     def test_bun_probe_script_matches_client_shape(self) -> None:
         script = manager.BUN_PROBE_SCRIPT
@@ -930,6 +936,12 @@ class ManagerLogicTests(unittest.TestCase):
             'TOOL_PARAMETER = { edit: "path", glob: "pattern", grep: "pattern", read: "path", shell: "command" }',
             "Working directory: ${cwd}",
             "Platform: ${process.platform}",
+            # 真实 CLI 始终携带 max_tokens；系统消息为完整指令 + 环境块；
+            # 429 的 retry-after 被回传用于展示额度重置时间
+            "max_tokens",
+            "SYSTEM_PREAMBLE",
+            "retry_after",
+            "response.headers.get(\"retry-after\")",
         ):
             self.assertIn(marker, script)
 
@@ -972,13 +984,14 @@ class ManagerLogicTests(unittest.TestCase):
         output = 'PROBE: {"status": 200, "content": "OK", "message": "", "latency": 123}\n'
         process = FakeProbeProcess(output)
         with self.patched_bun_probe(process) as captured:
-            status, message, latency = manager.opencode_probe_fetch(
+            status, message, latency, reset_at = manager.opencode_probe_fetch(
                 self.opencode_probe_target(), "beam-free", 0x4F430002, threading.Event()
             )
 
         self.assertEqual("available", status)
         self.assertIn("OK", message)
         self.assertEqual(123, latency)
+        self.assertEqual(0.0, reset_at)
         proxy_cls = captured["proxy_cls"]
         proxy_args = proxy_cls.call_args[0]
         self.assertEqual("opencode.ai", proxy_args[0]["host"])
@@ -996,12 +1009,13 @@ class ManagerLogicTests(unittest.TestCase):
         process = FakeProbeProcess("", finish_after=None)
         with mock.patch.object(manager, "OPENCODE_CHECK_TIMEOUT_SECONDS", 1):
             with self.patched_bun_probe(process) as captured:
-                status, message, _ = manager.opencode_probe_fetch(
+                status, message, _, reset_at = manager.opencode_probe_fetch(
                     self.opencode_probe_target(), "beam-free", 0, threading.Event()
                 )
 
         self.assertEqual("failed", status)
         self.assertIn("超时", message)
+        self.assertEqual(0.0, reset_at)
         self.assertTrue(process.killed)
 
     def test_opencode_probe_honors_cancel_before_start(self) -> None:
@@ -1009,7 +1023,7 @@ class ManagerLogicTests(unittest.TestCase):
         cancel.set()
         process = FakeProbeProcess("", finish_after=None)
         with self.patched_bun_probe(process) as captured:
-            status, message, _ = manager.opencode_probe_fetch(
+            status, message, _, _ = manager.opencode_probe_fetch(
                 self.opencode_probe_target(), "beam-free", 0, cancel
             )
 
@@ -1021,13 +1035,30 @@ class ManagerLogicTests(unittest.TestCase):
     def test_opencode_probe_surfaces_proxy_failure(self) -> None:
         process = FakeProbeProcess("bun: 1 | ERROR boom")
         with self.patched_bun_probe(process) as captured:
-            status, message, _ = manager.opencode_probe_fetch(
+            status, message, _, _ = manager.opencode_probe_fetch(
                 self.opencode_probe_target(), "beam-free", 0, threading.Event()
             )
 
         self.assertEqual("failed", status)
         self.assertIn("连接 OpenCode API 失败", message)
         self.assertFalse(process.killed)
+
+    def test_opencode_probe_limited_result_carries_reset_time(self) -> None:
+        output = (
+            'PROBE: {"status": 429, "content": "", '
+            '"message": "Free usage limit reached. Free models work in OpenCode", '
+            '"latency": 210, "retry_after": 3600}\n'
+        )
+        process = FakeProbeProcess(output)
+        with self.patched_bun_probe(process) as captured:
+            status, message, _, reset_at = manager.opencode_probe_fetch(
+                self.opencode_probe_target(), "beam-free", 0, threading.Event()
+            )
+
+        self.assertEqual("limited", status)
+        self.assertGreater(reset_at, time.time())
+        self.assertLessEqual(reset_at, time.time() + 3600)
+        self.assertIn("UTC 重置", message)
 
     def opencode_probe_target(self) -> dict:
         return {
@@ -1104,6 +1135,48 @@ class ManagerLogicTests(unittest.TestCase):
         manager.reset_stale_opencode_checks()
         stored = {node["id"]: node for node in manager.read_nodes()}
         self.assertEqual("", stored[nodes[0]["id"]]["opencode_status"])
+
+    def test_opencode_check_skips_limited_nodes_until_reset(self) -> None:
+        nodes = self.write_nodes(3)
+        # node-0：额度用尽且重置时间在未来 → 跳过重复请求
+        nodes[0]["opencode_status"] = "limited"
+        nodes[0]["opencode_message"] = "额度用尽（IP 每日额度，16:00 UTC 重置）"
+        nodes[0]["opencode_reset_at"] = time.time() + 3600
+        # node-1：额度用尽但重置时间已过 → 重新检测
+        nodes[1]["opencode_status"] = "limited"
+        nodes[1]["opencode_reset_at"] = time.time() - 10
+        manager.write_json(manager.NODES_FILE, nodes)
+
+        probed: list[str] = []
+
+        def fake_probe_node(node, target, model, cancel_event):
+            probed.append(str(node.get("id")))
+            return {
+                "id": str(node.get("id")),
+                "opencode_status": "available",
+                "opencode_message": "正常回复: OK",
+                "opencode_model": model,
+                "opencode_latency_ms": 100,
+                "opencode_checked_at": time.time(),
+                "opencode_reset_at": 0.0,
+            }
+
+        with (
+            mock.patch.object(manager, "ensure_opencode_probe_supported"),
+            mock.patch.object(manager, "ensure_opencode_probe_script", return_value=Path("probe.mjs")),
+            mock.patch.object(manager, "resolve_opencode_model", return_value="beam-free"),
+            mock.patch.object(manager, "resolve_opencode_target", return_value=self.opencode_probe_target()),
+            mock.patch.object(manager, "opencode_probe_node", side_effect=fake_probe_node),
+        ):
+            manager._run_opencode_check([str(node["id"]) for node in nodes])
+
+        self.assertEqual(["node-1", "node-2"], probed)
+        stored = {node["id"]: node for node in manager.read_nodes()}
+        self.assertEqual("limited", stored["node-0"]["opencode_status"])
+        self.assertIn("重置前跳过重复检测", stored["node-0"]["opencode_message"])
+        self.assertGreater(float(stored["node-0"]["opencode_reset_at"]), time.time())
+        self.assertEqual("available", stored["node-1"]["opencode_status"])
+        self.assertEqual("available", stored["node-2"]["opencode_status"])
 
     def test_opencode_state_is_exposed_and_blocks_switching(self) -> None:
         manager.update_opencode_check_stats(running=True, total=3, done=1, available=1)
