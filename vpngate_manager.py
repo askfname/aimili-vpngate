@@ -5712,8 +5712,16 @@ INDEX_HTML = r"""<!doctype html>
       outline: none;
     }
 
-    .opencode-toolbar-btn {
+    .toolbar-actions {
+      display: flex;
+      gap: 8px;
       margin-left: auto;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      min-width: 0;
+    }
+
+    .opencode-toolbar-btn {
       height: 42px;
       gap: 6px;
       color: #a5b4fc;
@@ -6597,18 +6605,20 @@ INDEX_HTML = r"""<!doctype html>
     <select id="opencode_model_select" class="opencode-model-select" title="选择用于检测的免费模型，默认使用列表第一个免费模型" onchange="onOpencodeModelChange(this.value)">
       <option value="">免费模型加载中...</option>
     </select>
-    <button id="btn_opencode_check" class="opencode-toolbar-btn" type="button" onclick="toggleOpencodeCheck()" title="检测当前筛选显示范围内的全部节点">
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-      </svg>
-      检测 OpenCode
-    </button>
-    <button id="btn_node_check" class="opencode-toolbar-btn" type="button" onclick="toggleNodeCheck()" title="检测当前筛选显示范围内的全部节点可用性">
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M22 12h-4l-3 9L9 3l-3 9H3" />
-      </svg>
-      检测可用性
-    </button>
+    <div class="toolbar-actions">
+      <button id="btn_opencode_check" class="opencode-toolbar-btn" type="button" onclick="toggleOpencodeCheck()" title="检测当前筛选显示范围内的全部节点">
+        <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+        </svg>
+        检测 OpenCode
+      </button>
+      <button id="btn_node_check" class="opencode-toolbar-btn" type="button" onclick="toggleNodeCheck()" title="检测当前筛选显示范围内的全部节点可用性">
+        <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M22 12h-4l-3 9L9 3l-3 9H3" />
+        </svg>
+        检测可用性
+      </button>
+    </div>
     <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
