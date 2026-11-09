@@ -1189,6 +1189,95 @@ class ManagerLogicTests(unittest.TestCase):
         finally:
             manager.opencode_check_lock.release()
 
+    def test_node_check_results_persist_and_reset_interrupted_checks(self) -> None:
+        nodes = self.write_nodes(2)
+        for node in nodes:
+            node["probe_status"] = "testing"
+        manager.write_json(manager.NODES_FILE, nodes)
+        pending = {
+            nodes[0]["id"]: {
+                "id": nodes[0]["id"],
+                "probe_status": "available",
+                "probe_message": "OpenVPN 初始化完成",
+                "latency_ms": 321,
+                "probed_at": 100.0,
+            }
+        }
+
+        manager.flush_node_results(pending, {nodes[1]["id"]})
+        stored = {node["id"]: node for node in manager.read_nodes()}
+        self.assertEqual("available", stored[nodes[0]["id"]]["probe_status"])
+        self.assertEqual(321, stored[nodes[0]["id"]]["latency_ms"])
+        self.assertEqual("not_checked", stored[nodes[1]["id"]]["probe_status"])
+        self.assertEqual("检测已取消", stored[nodes[1]["id"]]["probe_message"])
+
+        stored[nodes[0]["id"]]["probe_status"] = "testing"
+        manager.write_json(manager.NODES_FILE, list(stored.values()))
+        manager.reset_stale_node_checks()
+        stored = {node["id"]: node for node in manager.read_nodes()}
+        self.assertEqual("not_checked", stored[nodes[0]["id"]]["probe_status"])
+        self.assertNotIn("testing", {node["probe_status"] for node in stored.values()})
+
+    def test_node_check_runs_batch_and_persists_results(self) -> None:
+        nodes = self.write_nodes(3)
+        probed: list[str] = []
+
+        def fake_probe_node(node, cancel_event):
+            probed.append(str(node.get("id")))
+            ok = str(node.get("id")) != "node-1"
+            return {
+                "id": str(node.get("id")),
+                "probe_status": "available" if ok else "unavailable",
+                "probe_message": "OpenVPN 初始化完成" if ok else "握手超时",
+                "latency_ms": 42,
+                "probed_at": time.time(),
+            }
+
+        with (
+            mock.patch.object(manager, "ensure_node_probe_supported"),
+            mock.patch.object(manager, "node_probe_node", side_effect=fake_probe_node),
+        ):
+            manager._run_node_check([str(node["id"]) for node in nodes])
+
+        self.assertEqual(3, len(probed))
+        stored = {node["id"]: node for node in manager.read_nodes()}
+        self.assertEqual("available", stored["node-0"]["probe_status"])
+        self.assertEqual("unavailable", stored["node-1"]["probe_status"])
+        self.assertEqual("available", stored["node-2"]["probe_status"])
+        stats = manager.node_check_snapshot()
+        self.assertFalse(stats["running"])
+        self.assertEqual(3, stats["done"])
+        self.assertEqual(2, stats["available"])
+        self.assertEqual(1, stats["failed"])
+        self.assertIn("可用 2 · 失效 1", stats["message"])
+
+    def test_node_check_state_is_exposed_and_blocks_switching(self) -> None:
+        manager.update_node_check_stats(running=True, total=3, done=1, available=1)
+        self.assertEqual(3, manager.get_state()["node_check"]["total"])
+
+        manager.node_check_lock.acquire()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                manager.begin_connection_attempt()
+            self.assertIn("节点可用性检测", str(ctx.exception))
+        finally:
+            manager.node_check_lock.release()
+
+    def test_web_dashboard_exposes_node_check_controls(self) -> None:
+        for marker in (
+            'id="btn_node_check"',
+            'id="node_check_panel"',
+            'id="node_check_progress_bar"',
+            "function getFilteredNodes",
+            "function startNodeCheck",
+            "function stopNodeCheck",
+            "function renderNodeCheckUI",
+            "./api/node_check",
+            "./api/node_check_stop",
+        ):
+            self.assertIn(marker, manager.INDEX_HTML)
+        self.assertIn("检测可用性", manager.INDEX_HTML)
+
     def test_web_dashboard_exposes_opencode_check_controls(self) -> None:
         for marker in (
             'id="btn_opencode_check"',
@@ -1209,9 +1298,9 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("只看可用", manager.INDEX_HTML)
         # 加载动画统一用 .spin 类锚定字形墨迹中心旋转，避免视觉偏移
         self.assertIn(".spin {\n      animation: spin 1s linear infinite;\n      transform-box: fill-box;\n      transform-origin: center;\n    }", manager.INDEX_HTML)
-        self.assertEqual(4, manager.INDEX_HTML.count('class="spin"'))
+        self.assertEqual(5, manager.INDEX_HTML.count('class="spin"'))
         # 工具栏按钮加载态与其余加载器使用同一居中的圆环扫弧字形
-        self.assertEqual(3, manager.INDEX_HTML.count('stroke="currentColor" stroke-opacity="0.2"'))
+        self.assertEqual(4, manager.INDEX_HTML.count('stroke="currentColor" stroke-opacity="0.2"'))
         self.assertIn('class="spin" style="width:16px; height:16px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">', manager.INDEX_HTML)
 
     def test_node_table_contains_latency_country_panel_and_test_action(self) -> None:

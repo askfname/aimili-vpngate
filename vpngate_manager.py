@@ -146,6 +146,8 @@ OPENCODE_CHECK_TIMEOUT_SECONDS = env_int("OPENCODE_CHECK_TIMEOUT_SECONDS", 20, 5
 OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS = env_int("OPENCODE_CHECK_CONNECT_TIMEOUT_SECONDS", 8, 2, 30)
 OPENCODE_OPENVPN_TIMEOUT_SECONDS = env_int("OPENCODE_OPENVPN_TIMEOUT_SECONDS", 12, 5, 60)
 OPENCODE_CHECK_NODE_LIMIT = env_int("OPENCODE_CHECK_NODE_LIMIT", 2000, 1, 10000)
+# 批量节点可用性检测（TUN 握手）单次节点上限
+NODE_CHECK_NODE_LIMIT = env_int("NODE_CHECK_NODE_LIMIT", 2000, 1, 10000)
 OPENCODE_RESULT_FLUSH_SECONDS = 0.8
 # 429 额度用尽的重置窗口内默认跳过重复检测（重置前结果不可能变化）
 OPENCODE_CHECK_SKIP_LIMITED = os.environ.get("OPENCODE_CHECK_SKIP_LIMITED", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -246,6 +248,22 @@ opencode_check_stats: dict[str, Any] = {
 _opencode_client_version: str = ""
 _opencode_client_version_at: float = 0.0
 _opencode_probe_script_lock = threading.Lock()
+
+node_check_lock = threading.Lock()
+node_check_cancel_event = threading.Event()
+node_check_stats_lock = threading.Lock()
+node_check_thread: threading.Thread | None = None
+node_check_stats: dict[str, Any] = {
+    "running": False,
+    "total": 0,
+    "done": 0,
+    "available": 0,
+    "failed": 0,
+    "message": "",
+    "started_at": 0.0,
+    "finished_at": 0.0,
+    "cancelled": False,
+}
 
 def opencode_client_version() -> str:
     """获取 OpenCode CLI 最新版本号伪装真实客户端，每 6 小时刷新，失败回退 2.2.5。"""
@@ -926,6 +944,7 @@ def get_state(nodes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     state["is_connecting"] = is_connecting
     state["maintenance_running"] = maintenance_lock.locked()
     state["opencode_check"] = opencode_check_snapshot()
+    state["node_check"] = node_check_snapshot()
     state.setdefault("api_url", API_URL)
     state.setdefault("mirror_url", MIRROR_HTTPS_URL)
     state.setdefault("last_fetch_source", "")
@@ -1742,6 +1761,9 @@ def begin_connection_attempt() -> tuple[int, threading.Event]:
         if opencode_check_lock.locked():
             connection_attempt_lock.release()
             raise RuntimeError("OpenCode 检测正在运行，请先停止检测再切换节点")
+        if node_check_lock.locked():
+            connection_attempt_lock.release()
+            raise RuntimeError("节点可用性检测正在运行，请先停止检测再切换节点")
         connection_epoch += 1
         token = connection_epoch
         active_connection_cancel_event = cancel_event
@@ -2552,6 +2574,31 @@ def reset_stale_opencode_checks() -> None:
             if node.get("opencode_status") == "checking":
                 node["opencode_status"] = ""
                 node["opencode_message"] = "上次检测已中断"
+                changed = True
+        if changed:
+            write_json(NODES_FILE, sort_all_nodes(nodes))
+
+def node_check_snapshot() -> dict[str, Any]:
+    with node_check_stats_lock:
+        snapshot = dict(node_check_stats)
+    thread = node_check_thread
+    if snapshot.get("running") and thread is not None and not thread.is_alive():
+        snapshot["running"] = False
+    return snapshot
+
+def update_node_check_stats(**updates: Any) -> None:
+    with node_check_stats_lock:
+        node_check_stats.update(updates)
+
+def reset_stale_node_checks() -> None:
+    with lock:
+        nodes = read_nodes()
+        changed = False
+        for node in nodes:
+            if node.get("probe_status") == "testing":
+                # probe_status 不能留空：sort_all_nodes 会丢弃空状态的节点
+                node["probe_status"] = "not_checked"
+                node["probe_message"] = "上次检测已中断"
                 changed = True
         if changed:
             write_json(NODES_FILE, sort_all_nodes(nodes))
@@ -3407,6 +3454,18 @@ def enable_opencode_rp_filter(tun: str) -> None:
         except Exception:
             pass
 
+def ensure_node_probe_supported() -> None:
+    """节点可用性检测依赖 OpenVPN + TUN 设备，需要 Linux 系统与相应权限。"""
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("节点可用性检测需要 Linux 系统")
+    try:
+        tun_fd = os.open("/dev/net/tun", os.O_RDWR)
+    except OSError as exc:
+        raise RuntimeError(
+            f"节点可用性检测需要 TUN 设备支持（/dev/net/tun，需 root 或 NET_ADMIN 权限）: {exc}"
+        ) from exc
+    os.close(tun_fd)
+
 def ensure_opencode_probe_supported() -> None:
     if not sys.platform.startswith("linux"):
         raise RuntimeError("OpenCode 检测需要 Linux 系统")
@@ -3527,6 +3586,78 @@ def flush_opencode_results(pending: dict[str, dict[str, Any]], reset_checking_id
             elif reset_checking_ids and node_id in reset_checking_ids and node.get("opencode_status") == "checking":
                 node["opencode_status"] = ""
                 node["opencode_message"] = "检测已取消"
+        write_json(NODES_FILE, sort_all_nodes(nodes))
+
+def node_probe_node(node: dict[str, Any], cancel_event: threading.Event) -> dict[str, Any]:
+    """单节点可用性检测：TCP 预检延迟 + OpenVPN 握手是否成功。"""
+    node_id = str(node.get("id") or "")
+    result = {
+        "id": node_id,
+        "probe_status": "not_checked",
+        "probe_message": "检测已取消",
+        "latency_ms": 0,
+        "probed_at": time.time(),
+    }
+    if cancel_event.is_set():
+        return result
+    test_index: int | None = None
+    temp_path: Path | None = None
+    try:
+        config_text = str(node.get("config_text") or "")
+        if not config_text:
+            result.update(probe_status="unavailable", probe_message="节点缺少 OpenVPN 配置")
+            return result
+        host = str(node.get("remote_host") or node.get("ip") or "")
+        port = parse_int(node.get("remote_port"))
+        fallback_ping = parse_int(node.get("ping"))
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        temp_path = test_config_path(node_id)
+        temp_path.write_text(config_text, encoding="utf-8")
+        latency = vpn_utils.ping_latency_ms(host, port, fallback_ping)
+        test_index = get_free_test_index()
+        ok, message, _ = run_openvpn_until_ready(
+            str(temp_path),
+            keep_alive=False,
+            route_nopull=True,
+            timeout=OPENCODE_OPENVPN_TIMEOUT_SECONDS,
+            dev=f"tun{test_index}",
+            cancel_event=cancel_event,
+        )
+        if cancel_event.is_set() and not ok:
+            return result
+        result.update(
+            probe_status="available" if ok else "unavailable",
+            probe_message=message,
+            latency_ms=latency,
+            probed_at=time.time(),
+        )
+        return result
+    except Exception as exc:
+        result.update(probe_status="unavailable", probe_message=f"检测异常: {exc}")
+        return result
+    finally:
+        if test_index is not None:
+            release_test_index(test_index)
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+def flush_node_results(pending: dict[str, dict[str, Any]], reset_checking_ids: set[str] | None = None) -> None:
+    if not pending and not reset_checking_ids:
+        return
+    with lock:
+        nodes = read_nodes()
+        for node in nodes:
+            node_id = str(node.get("id") or "")
+            update = pending.get(node_id)
+            if update:
+                node.update(update)
+            elif reset_checking_ids and node_id in reset_checking_ids and node.get("probe_status") == "testing":
+                # probe_status 不能写空值：sort_all_nodes 会把空状态的节点从列表中丢掉
+                node["probe_status"] = "not_checked"
+                node["probe_message"] = "检测已取消"
         write_json(NODES_FILE, sort_all_nodes(nodes))
 
 def _run_opencode_check(node_ids: list[str], requested_model: str = "", force: bool = False) -> None:
@@ -3761,6 +3892,198 @@ def stop_opencode_check() -> bool:
         return False
     opencode_check_cancel_event.set()
     update_opencode_check_stats(message="正在停止 OpenCode 检测...")
+    return True
+
+def _run_node_check(node_ids: list[str]) -> None:
+    global node_check_thread
+    cancel_event = node_check_cancel_event
+    counters = {"available": 0, "failed": 0, "done": 0}
+    selected: list[dict[str, Any]] = []
+    pending: dict[str, dict[str, Any]] = {}
+    last_flush = time.time()
+    systemic_message = ""
+    try:
+        update_node_check_stats(message="正在准备节点可用性检测...")
+        try:
+            ensure_node_probe_supported()
+        except Exception as exc:
+            update_node_check_stats(
+                running=False,
+                message=opencode_short_text(f"检测无法启动: {exc}"),
+                finished_at=time.time(),
+            )
+            return
+        update_node_check_stats(message="正在建立并发测试隧道...")
+        with lock:
+            wanted = set(node_ids)
+            nodes = read_nodes()
+            selected = [node for node in nodes if str(node.get("id") or "") in wanted]
+            probe_nodes: list[dict[str, Any]] = []
+            for node in selected:
+                node["probe_status"] = "testing"
+                node["probe_message"] = "正在检测节点连通性..."
+                node["latency_ms"] = 0
+                node["probed_at"] = 0
+                probe_nodes.append(node)
+            write_json(NODES_FILE, sort_all_nodes(nodes))
+        update_node_check_stats(
+            total=len(selected),
+            done=0,
+            available=0,
+            failed=0,
+            message="正在并发检测节点可用性...",
+        )
+        if not selected:
+            update_node_check_stats(
+                running=False,
+                message="筛选范围内没有可检测的节点",
+                finished_at=time.time(),
+            )
+            return
+
+        worker_count = min(NODE_PROBE_WORKERS, len(probe_nodes))
+        futures_cancelled = False
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(node_probe_node, node, cancel_event): str(node.get("id") or "")
+                for node in probe_nodes
+            }
+            for future in concurrent.futures.as_completed(futures):
+                node_id = futures[future]
+                try:
+                    result = future.result()
+                except concurrent.futures.CancelledError:
+                    continue
+                except Exception as exc:
+                    result = {
+                        "id": node_id,
+                        "probe_status": "unavailable",
+                        "probe_message": f"检测异常: {exc}",
+                        "latency_ms": 0,
+                        "probed_at": time.time(),
+                    }
+                counters["done"] += 1
+                status = str(result.get("probe_status") or "")
+                if status == "available":
+                    counters["available"] += 1
+                elif status == "unavailable":
+                    counters["failed"] += 1
+                pending[node_id] = result
+                if status == "unavailable" and is_systemic_probe_failure(result.get("probe_message")):
+                    # 系统级 OpenVPN 故障（缺 tun/权限等）：中止剩余节点避免逐个浪费时间
+                    systemic_message = str(result.get("probe_message") or "")
+                    cancel_event.set()
+                update_node_check_stats(
+                    done=counters["done"],
+                    available=counters["available"],
+                    failed=counters["failed"],
+                )
+                now = time.time()
+                if cancel_event.is_set() or now - last_flush >= OPENCODE_RESULT_FLUSH_SECONDS:
+                    flush_node_results(pending)
+                    pending.clear()
+                    last_flush = now
+                if cancel_event.is_set() and not futures_cancelled:
+                    futures_cancelled = True
+                    for pending_future in futures:
+                        pending_future.cancel()
+
+        reset_ids = {str(node.get("id") or "") for node in selected if str(node.get("id") or "") not in pending}
+        flush_node_results(pending, reset_ids)
+        pending.clear()
+
+        cancelled = cancel_event.is_set()
+        available = counters["available"]
+        failed = counters["failed"]
+        if systemic_message:
+            message = f"检测中止：{systemic_message}"
+        elif cancelled:
+            message = f"检测已停止：可用 {available} · 失效 {failed}"
+        elif available:
+            message = f"检测完成：可用 {available} · 失效 {failed}"
+        else:
+            message = f"检测完成：未发现可用节点 · 失效 {failed}"
+        print(f"[节点检测] {message}", flush=True)
+        log_to_json("INFO" if available else "WARNING", "VPN", message)
+        update_node_check_stats(
+            running=False,
+            cancelled=cancelled,
+            message=message,
+            finished_at=time.time(),
+        )
+    except Exception as exc:
+        message = f"节点可用性检测异常终止: {exc}"
+        print(f"[节点检测] {message}", flush=True)
+        log_to_json("ERROR", "VPN", message)
+        update_node_check_stats(
+            running=False,
+            message=message,
+            finished_at=time.time(),
+        )
+    finally:
+        node_check_thread = None
+        if maintenance_lock.locked():
+            try:
+                maintenance_lock.release()
+            except RuntimeError:
+                pass
+        try:
+            node_check_lock.release()
+        except RuntimeError:
+            pass
+
+def start_node_check(node_ids: list[str]) -> dict[str, Any]:
+    global node_check_thread
+    unique_ids = list(dict.fromkeys(str(node_id or "").strip() for node_id in node_ids if str(node_id or "").strip()))
+    if not unique_ids:
+        raise ValueError("缺少需要检测的节点 ID")
+    if len(unique_ids) > NODE_CHECK_NODE_LIMIT:
+        raise ValueError(f"单次最多检测 {NODE_CHECK_NODE_LIMIT} 个节点")
+    ensure_node_probe_supported()
+    if not node_check_lock.acquire(blocking=False):
+        raise RuntimeError("节点可用性检测已在运行，请稍后再试")
+    maintenance_acquired = False
+    try:
+        with lock:
+            if is_connecting:
+                raise RuntimeError("当前已有连接或节点任务正在运行，请稍后再试")
+        if not maintenance_lock.acquire(blocking=False):
+            raise RuntimeError("当前已有连接或节点维护任务正在运行，请稍后再试")
+        maintenance_acquired = True
+        node_check_cancel_event.clear()
+        update_node_check_stats(
+            running=True,
+            total=len(unique_ids),
+            done=0,
+            available=0,
+            failed=0,
+            message="正在准备节点可用性检测...",
+            started_at=time.time(),
+            finished_at=0.0,
+            cancelled=False,
+        )
+        thread = threading.Thread(target=_run_node_check, args=(unique_ids,), daemon=True)
+        node_check_thread = thread
+        thread.start()
+        return node_check_snapshot()
+    except Exception:
+        if maintenance_acquired:
+            try:
+                maintenance_lock.release()
+            except RuntimeError:
+                pass
+        try:
+            node_check_lock.release()
+        except RuntimeError:
+            pass
+        raise
+
+def stop_node_check() -> bool:
+    snapshot = node_check_snapshot()
+    if not snapshot.get("running"):
+        return False
+    node_check_cancel_event.set()
+    update_node_check_stats(message="正在停止节点可用性检测...")
     return True
 
 def cancel_background_refill() -> None:
@@ -4726,8 +5049,27 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-secondary);
       margin-top: 4px;
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 8px;
+      column-gap: 16px;
+      row-gap: 6px;
+      min-width: 0;
+      line-height: 1.5;
+    }
+
+    .status-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      font-weight: 500;
+    }
+
+    .status-text {
+      min-width: 0;
+      overflow-wrap: break-word;
+      word-break: break-word;
+      font-weight: 400;
     }
 
     .status-dot {
@@ -5865,6 +6207,13 @@ INDEX_HTML = r"""<!doctype html>
       .toolbar > input {
         font-size: 16px;
       }
+      .status {
+        font-size: 12px;
+        flex-direction: column;
+        align-items: flex-start;
+        column-gap: 0;
+        row-gap: 4px;
+      }
     }
     
     /* Admin dropdown styles */
@@ -6108,7 +6457,7 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
       AimiliVPN 节点管理系统
     </h1>
-    <div id="status" class="status" role="status" aria-live="polite"><span class="status-dot"></span>服务加载中...</div>
+    <div id="status" class="status" role="status" aria-live="polite"><span class="status-item"><span class="status-dot"></span><span class="status-text">服务加载中...</span></span></div>
   </div>
   <div class="btn-group">
 
@@ -6254,6 +6603,12 @@ INDEX_HTML = r"""<!doctype html>
       </svg>
       检测 OpenCode
     </button>
+    <button id="btn_node_check" class="opencode-toolbar-btn" type="button" onclick="toggleNodeCheck()" title="检测当前筛选显示范围内的全部节点可用性">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M22 12h-4l-3 9L9 3l-3 9H3" />
+      </svg>
+      检测可用性
+    </button>
     <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
@@ -6294,6 +6649,35 @@ INDEX_HTML = r"""<!doctype html>
     <div class="opencode-panel-foot">
       <span>已完成 <strong id="opencode_done_label" style="color: var(--text-primary);">0</strong> / <strong id="opencode_total_label" style="color: var(--text-primary);">0</strong> 个节点</span>
       <span id="opencode_scope_label"></span>
+    </div>
+  </section>
+  <section id="node_check_panel" class="opencode-panel" aria-live="polite" hidden>
+    <div class="opencode-panel-head">
+      <div class="opencode-panel-title">
+        <span class="opencode-logo" aria-hidden="true">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M22 12h-4l-3 9L9 3l-3 9H3" />
+          </svg>
+        </span>
+        <div class="opencode-title-text">
+          <strong>节点可用性检测</strong>
+          <span id="node_check_panel_message" class="opencode-panel-message">等待开始检测</span>
+        </div>
+      </div>
+      <div class="opencode-panel-actions">
+        <button id="node_check_panel_close" class="opencode-close" type="button" onclick="closeNodeCheckPanel()">收起</button>
+      </div>
+    </div>
+    <div class="opencode-metrics">
+      <span class="opencode-metric available"><strong id="node_check_available_count">0</strong> 可用</span>
+      <span class="opencode-metric failed"><strong id="node_check_failed_count">0</strong> 失效</span>
+    </div>
+    <div class="opencode-progress" role="progressbar" aria-label="节点可用性检测进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="node_check_progress">
+      <div id="node_check_progress_bar" class="opencode-progress-bar"></div>
+    </div>
+    <div class="opencode-panel-foot">
+      <span>已完成 <strong id="node_check_done_label" style="color: var(--text-primary);">0</strong> / <strong id="node_check_total_label" style="color: var(--text-primary);">0</strong> 个节点</span>
+      <span id="node_check_scope_label"></span>
     </div>
   </section>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
@@ -6629,6 +7013,9 @@ let showOpencodeAvailableOnly = false;
 let opencodePanelDismissed = false;
 let opencodePollInterval = null;
 let opencodeActionInFlight = false;
+let nodeCheckPanelDismissed = false;
+let nodeCheckPollInterval = null;
+let nodeCheckActionInFlight = false;
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -7308,6 +7695,146 @@ function toggleOpencodeAvailableOnly(checked){
   render();
 }
 
+function nodeCheckStatsSnapshot(){
+  return (state && state.node_check) || {};
+}
+
+function renderNodeCheckUI(){
+  const stats = nodeCheckStatsSnapshot();
+  const running = Boolean(stats.running);
+  const btn = $("btn_node_check");
+  if (btn) {
+    const mode = running ? "running" : "idle";
+    if (btn.dataset.mode !== mode) {
+      btn.dataset.mode = mode;
+      btn.classList.toggle("running", running);
+      btn.innerHTML = running
+        ? `<svg class="spin" style="width:16px; height:16px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>停止检测`
+        : `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M22 12h-4l-3 9L9 3l-3 9H3" /></svg>检测可用性`;
+    }
+    btn.disabled = nodeCheckActionInFlight;
+    btn.title = running ? "点击停止当前节点可用性检测" : `检测当前筛选显示范围内的 ${getFilteredNodes().length} 个节点`;
+  }
+
+  const panel = $("node_check_panel");
+  const show = !nodeCheckPanelDismissed && (running || Number(stats.total || 0) > 0);
+  if (panel) panel.hidden = !show;
+  if (!show) return;
+
+  if ($("node_check_panel_message")) {
+    $("node_check_panel_message").textContent = stats.message || (running ? "正在检测..." : "等待开始检测");
+  }
+  const total = Math.max(0, Number(stats.total || 0));
+  const done = Math.max(0, Number(stats.done || 0));
+  if ($("node_check_available_count")) $("node_check_available_count").textContent = Math.max(0, Number(stats.available || 0));
+  if ($("node_check_failed_count")) $("node_check_failed_count").textContent = Math.max(0, Number(stats.failed || 0));
+  if ($("node_check_done_label")) $("node_check_done_label").textContent = done;
+  if ($("node_check_total_label")) $("node_check_total_label").textContent = total;
+  const percent = total > 0 ? Math.min(100, Math.round(done / total * 100)) : 0;
+  if ($("node_check_progress_bar")) $("node_check_progress_bar").style.width = `${percent}%`;
+  if ($("node_check_progress")) $("node_check_progress").setAttribute("aria-valuenow", String(percent));
+  const ipTypeText = $("ip_type_filter") && $("ip_type_filter").selectedOptions[0]
+    ? $("ip_type_filter").selectedOptions[0].textContent
+    : "所有IP类型";
+  const countryText = $("country_filter_label") ? $("country_filter_label").textContent : "所有国家";
+  if ($("node_check_scope_label")) {
+    $("node_check_scope_label").textContent = `范围：${countryText} · ${ipTypeText} · 当前筛选显示 ${getFilteredNodes().length} 个`;
+  }
+}
+
+function startNodeCheckPolling(){
+  if (nodeCheckPollInterval) return;
+  nodeCheckPollInterval = setInterval(async () => {
+    if (!isPageVisible()) return;
+    try {
+      const data = await fetchNodesSnapshot();
+      applyNodesSnapshot(data);
+      if (!nodeCheckStatsSnapshot().running) stopNodeCheckPolling();
+    } catch (error) {}
+  }, 1000);
+}
+
+function stopNodeCheckPolling(){
+  if (nodeCheckPollInterval) {
+    clearInterval(nodeCheckPollInterval);
+    nodeCheckPollInterval = null;
+  }
+}
+
+async function startNodeCheck(){
+  if (nodeCheckActionInFlight) return;
+  // 检测范围 = 页面当前筛选（国家/IP类型/状态/仅可用/收藏）实际显示的节点
+  const candidates = getFilteredNodes();
+  if (!candidates.length) {
+    alert("当前筛选显示范围内没有可检测的节点");
+    return;
+  }
+  // 估算耗时：NODE_PROBE_WORKERS(5) 并发，单节点最长约 12 秒（OpenVPN 握手超时）
+  if (candidates.length > 100) {
+    const minutes = Math.max(1, Math.ceil(candidates.length / 5 * 12 / 60));
+    if (!confirm(`将通过当前筛选显示的 ${candidates.length} 个节点逐个建立临时隧道检测连通性，预计耗时约 ${minutes} 分钟。检测期间请勿切换节点，是否继续？`)) {
+      return;
+    }
+  }
+  nodeCheckActionInFlight = true;
+  nodeCheckPanelDismissed = false;
+  state.node_check = Object.assign({}, nodeCheckStatsSnapshot(), {
+    running: true,
+    total: candidates.length,
+    done: 0,
+    available: 0,
+    failed: 0,
+    cancelled: false,
+    message: "正在启动节点可用性检测...",
+  });
+  render();
+  try {
+    const response = await fetchWithTimeout("./api/node_check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: candidates.map(n => n.id) }),
+    }, 30000);
+    const result = await readJsonResponse(response, "节点可用性检测启动失败");
+    state.node_check = result.node_check || state.node_check;
+    startNodeCheckPolling();
+  } catch (error) {
+    state.node_check = Object.assign({}, nodeCheckStatsSnapshot(), {
+      running: false,
+      message: `检测启动失败：${error.message || "未知错误"}`,
+    });
+    alert("节点可用性检测启动失败: " + (error.message || "未知错误"));
+  } finally {
+    nodeCheckActionInFlight = false;
+    render();
+  }
+}
+
+async function stopNodeCheck(){
+  if (nodeCheckActionInFlight) return;
+  nodeCheckActionInFlight = true;
+  try {
+    const response = await fetchWithTimeout("./api/node_check_stop", { method: "POST" }, 20000);
+    const result = await readJsonResponse(response, "停止节点可用性检测失败");
+    if (result.node_check) state.node_check = result.node_check;
+    startNodeCheckPolling();
+  } catch (error) {
+    alert("停止节点可用性检测失败: " + (error.message || "未知错误"));
+  } finally {
+    nodeCheckActionInFlight = false;
+    render();
+  }
+}
+
+function toggleNodeCheck(){
+  if (nodeCheckStatsSnapshot().running) return stopNodeCheck();
+  return startNodeCheck();
+}
+
+function closeNodeCheckPanel(){
+  nodeCheckPanelDismissed = true;
+  renderNodeCheckUI();
+}
+
 function stableSortNodes() {
   nodes.sort((a, b) => {
     if (!a || !b) return 0;
@@ -7422,7 +7949,13 @@ function render(){
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${esc(activeNode.id)})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const localProxy = state.local_proxy || `http://127.0.0.1:${state.proxy_port || 7928}`;
-  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${esc(localProxy)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}`; }
+  if ($("status")) {
+    // 状态信息拆分为独立标签段：桌面端同行流式排列，窄屏逐行堆叠，长文本在段内换行
+    $("status").innerHTML =
+      `<span class="status-item"><span class="status-dot"></span><span class="status-text">HTTP 代理本地接口：${esc(localProxy)}</span></span>` +
+      `<span class="status-item">活动节点：${activeNodeInfo}</span>` +
+      `<span class="status-item">状态：${esc(statusMessage)}</span>`;
+  }
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -7475,6 +8008,7 @@ function render(){
 
   updateFavPanelUI();
   renderOpencodeUI();
+  renderNodeCheckUI();
 
   // Pagination calculation
   const totalPages = Math.ceil(shown.length / pageSize) || 1;
@@ -9788,6 +10322,29 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "stopped": stopped, "opencode_check": opencode_check_snapshot()})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/node_check":
+            try:
+                payload = self.read_json_body(max_bytes=262144)
+                raw_ids = payload.get("ids", [])
+                if not isinstance(raw_ids, list):
+                    raise ValueError("节点 ID 列表无效")
+                node_ids = [str(node_id or "").strip() for node_id in raw_ids]
+                node_ids = [node_id for node_id in node_ids if node_id]
+                if not node_ids:
+                    raise ValueError("筛选范围内没有可检测的节点")
+                self.send_json({"ok": True, "node_check": start_node_check(node_ids)})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except RuntimeError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/node_check_stop":
+            try:
+                stopped = stop_node_check()
+                self.send_json({"ok": True, "stopped": stopped, "node_check": node_check_snapshot()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/opencode_model":
             try:
                 payload = self.read_json_body()
@@ -9933,6 +10490,7 @@ def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
     reset_stale_opencode_checks()
+    reset_stale_node_checks()
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
